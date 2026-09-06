@@ -1,0 +1,4 @@
+# PQROOT02 deterministic root-key encoding
+# Encoding: lowercase hexadecimal; all values are public test data.
+5051524f4f5430320001606162636465666768696a6b6c6d6e6f01020304707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f
+

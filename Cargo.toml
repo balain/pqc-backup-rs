@@ -1,0 +1,16 @@
+[package]
+name = "pqbackup"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Local post-quantum backup envelope for .tgz and other files"
+
+[dependencies]
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+getrandom = "0.4.3"
+hkdf = "0.13.0"
+ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
+sha2 = "0.11.0"
+zeroize = { version = "1.8", features = ["derive"] }
