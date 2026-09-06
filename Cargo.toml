@@ -2,7 +2,7 @@
 name = "pqbackup"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "Local post-quantum backup envelope for .tgz and other files"
 
 [dependencies]
