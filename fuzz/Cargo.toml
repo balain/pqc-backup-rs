@@ -1,0 +1,43 @@
+[package]
+name = "pqbackup-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+getrandom = "0.4.3"
+hkdf = "0.13.0"
+libfuzzer-sys = "0.4"
+ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
+sha2 = "0.11.0"
+zeroize = { version = "1.8", features = ["derive"] }
+
+[[bin]]
+name = "decode-header"
+path = "fuzz_targets/decode_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode-root-key"
+path = "fuzz_targets/decode_root_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame-traversal"
+path = "fuzz_targets/frame_traversal.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

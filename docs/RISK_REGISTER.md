@@ -7,16 +7,16 @@
 | --- | --- | --- | --- | --- | --- |
 | R-001 | `ml-kem` 0.3.2 has no independent audit | High | External dependency | Maintainer | Track upstream; independent package review in Phase 6; do not claim validation. |
 | R-002 | Custom formats lack byte-level specifications and stable vectors | High | Mitigated | Maintainer | Phase 1 added frozen format documents and deterministic positive/negative vectors. |
-| R-003 | Hostile parser coverage is limited | High | Open | Maintainer | Phase 2 corruption suite, property tests, and fuzzing. |
+| R-003 | Hostile parser coverage is limited | High | Mitigated | Maintainer | Phase 2 added corruption/truncation/property tests, production-parser fuzz targets, ASan smoke campaigns, and CI fuzzing. Continue growing the corpus. |
 | R-004 | Endpoint compromise exposes plaintext and active secrets | Critical | Accepted/deferred | Operator | Hardened recovery host and custody now; provider/memory controls in Phase 3. Cannot be eliminated in software alone. |
 | R-005 | Co-locating both recovery secrets defeats separation | Critical | Mitigated | Operator | Combined `keygen` removed; separate commands and explicit demo warning implemented in Phase 0. |
 | R-006 | Loss of either secret class makes archives unrecoverable | Critical | Open | Operator | Redundant independent custody copies and clean restore drills in Phase 3. |
-| R-007 | No explicit conservative archive-size/chunk-count enforcement | High | Open | Maintainer | Phase 0 target: 1 TiB and 2^20 chunks; enforce and test in Phase 2. |
+| R-007 | No explicit conservative archive-size/chunk-count enforcement | High | Mitigated | Maintainer | Phase 2 enforces and boundary-tests 1 TiB plaintext and 2^20 data-frame ceilings. |
 | R-008 | No creator authentication, timestamp, or rollback protection | Medium | Accepted/deferred | Product owner | Explicitly out of current scope; Phase 5 only after trust/revocation design. |
 | R-009 | Visible length and routing metadata enable inference | Medium | Accepted/deferred | Product owner | Document exposure; padding/profile decision requires a future format design. |
 | R-010 | `inspect` metadata may be attacker-controlled | Medium | Mitigated | Operator | CLI/docs label it unauthenticated routing data; recovery AEAD remains authoritative. |
 | R-011 | Secret zeroization cannot prevent swap, dumps, or OS inspection | High | Open | Maintainer | Evaluate memory locking, crash-dump policy, and hardware-backed providers in Phase 3. |
-| R-012 | Filename portability and normalization rules are incomplete | High | Open | Maintainer | Phase 2 cross-platform validation and path-misuse tests. |
+| R-012 | Filename portability and normalization rules are incomplete | High | Mitigated | Maintainer | Supported scope is macOS/Linux; v2 preserves UTF-8 without normalization and rejects unsafe single-component names, with path-misuse tests. |
 | R-013 | Dependency or build supply-chain compromise | High | Open | Maintainer | Phase 4 pinned toolchain, vulnerability checks, SBOM, signed/reproducible releases. |
 | R-014 | Future environment may not rebuild or run the decoder | Critical | Open | Maintainer | Phase 4 signed recovery kit and offline clean-room restore tests. |
 | R-015 | Storage deletion, corruption, or replay remains possible | High | Accepted/deferred | Operator | Independent archive copies and catalogs; provenance option in Phase 5. |

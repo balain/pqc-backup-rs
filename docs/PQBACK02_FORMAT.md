@@ -29,7 +29,7 @@ Offsets are relative to the first byte after `header_length`.
 | 12 | 2 | KDF ID | `1` = HKDF-SHA-384 |
 | 14 | 2 | AEAD ID | `1` = AES-256-GCM |
 | 16 | 4 | chunk size | 1 through 16,777,216 |
-| 20 | 8 | original length | plaintext byte length |
+| 20 | 8 | original length | plaintext byte length, at most 1,099,511,627,776 |
 | 28 | 16 | root-key ID | opaque, stable identifier |
 | 44 | 4 | root-key epoch | deployment-defined unsigned epoch |
 | 48 | 32 | HKDF salt | random per archive |
@@ -132,6 +132,10 @@ nonce = data_nonce_prefix[8] || u32(chunk_index)
 ```
 
 Indexes start at zero and increase by exactly one. Counter wrap is forbidden.
+This implementation permits at most 1,048,576 frames under one DEK, so the
+counter cannot approach its 32-bit wrap point. The random 64-bit prefix is fixed
+for the archive and each distinct index therefore produces a distinct 96-bit
+nonce under that archive's fresh DEK.
 
 ### Data AAD
 
@@ -179,11 +183,12 @@ See [ERROR_CATEGORIES.md](./ERROR_CATEGORIES.md) for the canonical categories.
 
 ## Output behavior
 
-Implementations MUST NOT expose a completed output file before all frames authenticate and the total length is checked. This implementation writes a unique same-directory temporary file, synchronizes it, and renames it after complete verification. It refuses to overwrite an existing destination.
+Implementations MUST NOT expose a completed output file before all frames authenticate and the total length is checked. This implementation writes and synchronizes a unique same-directory temporary file, then atomically publishes it with a no-replace hard link after complete verification. It refuses to overwrite an existing destination and removes the temporary link after publication.
 
-## Current operational ceiling
+## Enforced operational ceiling
 
-See [SUPPORTED_LIMITS.md](./SUPPORTED_LIMITS.md). Until Phase 2 enforces lower bounds, operators MUST keep plaintext at or below 1 TiB and use no more than 2^20 chunks.
+See [SUPPORTED_LIMITS.md](./SUPPORTED_LIMITS.md). This implementation rejects
+plaintext over 1 TiB and archives requiring more than 2^20 data frames.
 
 ## Test vectors
 

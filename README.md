@@ -22,6 +22,7 @@ Security policy and planning documents:
 - [Decoder error categories](docs/ERROR_CATEGORIES.md)
 - [Long-term security assessment](docs/LONG_TERM_SECURITY_ASSESSMENT.md)
 - [Improvement plan](docs/IMPROVEMENT_PLAN.md)
+- [Parser fuzzing](docs/FUZZING.md)
 - [Deterministic test vectors](test-vectors/manifest.md)
 
 ## Quick start: run the complete demo
@@ -238,8 +239,9 @@ root key and ML-KEM seed authenticate it, then restores into the current
 directory. To avoid an accidental filename collision or to choose a destination
 explicitly, always pass `--output` in scripts.
 
-The restore is written to a same-directory temporary file and renamed only after
-every chunk authenticates. A failed restore leaves no completed output file.
+The restore is written to a same-directory temporary file and atomically
+published without overwriting an existing name only after every chunk
+authenticates. A failed restore leaves no completed output file.
 
 ## Verify without writing plaintext
 
@@ -309,6 +311,14 @@ The final flag is authenticated. Restore rejects:
 
 Each backup uses a fresh random DEK and nonce prefix, so AES-GCM nonces are not
 reused under the same DEK.
+
+## Enforced archive limits
+
+The decoder and sealer enforce both a 1 TiB plaintext ceiling and a maximum of
+1,048,576 authenticated data frames per archive. The smaller limit applies.
+Chunk sizes must be between 1 byte and 16 MiB; the default is 4 MiB. Header and
+frame allocations are bounded before memory is allocated. See
+[supported limits](docs/SUPPORTED_LIMITS.md) for the complete policy.
 
 ## Important limitations
 

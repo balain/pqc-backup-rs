@@ -4,7 +4,7 @@
 **Basis:** [Long-term security assessment](./LONG_TERM_SECURITY_ASSESSMENT.md)  
 **Current format:** `PQBACK02` archives and `PQROOT02` root keys
 
-**Phase status:** Phases 0 and 1 completed on 2026-09-06. Later phases remain planned.
+**Phase status:** Phases 0, 1, and 2 completed on 2026-09-06. Later phases remain planned.
 
 ## Objective
 
@@ -114,6 +114,15 @@ vectors are versioned in `docs/` and `test-vectors/`.
 
 ## Phase 2 — Harden parsing, limits, and cryptographic usage
 
+**Status: Completed (2026-09-06).** The implementation now enforces 1 TiB and
+2^20-frame ceilings, bounds parser allocations, uses checked arithmetic and
+private atomic temporary files, performs single-pass recovery, and builds
+without warnings. Tests cover boundary, end-to-end, corruption, truncation,
+wrong-key, path, collision, permission, and simulated storage-failure cases.
+Three production-parser fuzz targets and CI smoke campaigns are in `fuzz/` and
+`.github/workflows/rust.yml`; local 1,000-run AddressSanitizer smoke campaigns
+completed without crashes on 2026-09-06.
+
 **Goal:** make hostile archive processing predictable and enforce the format’s security bounds.
 
 ### Work
@@ -124,7 +133,7 @@ vectors are versioned in `docs/` and `test-vectors/`.
 - Cap all allocations derived from archive-controlled values.
 - Review error paths so authentication failures never leave completed plaintext output.
 - Ensure temporary files use restrictive permissions and are cleaned up on every failure path.
-- Normalize and validate restored filenames for all supported platforms; reject separators, reserved names, ambiguous Unicode cases, and path traversal.
+- Validate restored filenames as single UTF-8 path components on supported macOS/Linux hosts; reject NUL, separators, dot/parent components, and path traversal. Preserve Unicode bytes without normalization so frozen v2 names do not silently change.
 - Review the two-pass filename/open flow for unnecessary secret operations and consistent failure behavior.
 - Replace deprecated nonce-construction APIs and eliminate compiler warnings.
 - Document and test that nonce values cannot repeat under one DEK.

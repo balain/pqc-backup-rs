@@ -27,6 +27,9 @@ const KDF_ID_HKDF_SHA384: u16 = 1;
 const AEAD_ID_AES256GCM: u16 = 1;
 const DEFAULT_CHUNK: u32 = 4 * 1024 * 1024;
 const MAX_CHUNK: u32 = 16 * 1024 * 1024;
+const MAX_HEADER_LEN: usize = 64 * 1024;
+const MAX_PLAINTEXT_LEN: u64 = 1 << 40;
+const MAX_DATA_CHUNKS: u64 = 1 << 20;
 const GCM_TAG_LEN: usize = 16;
 const MLKEM1024_CT_LEN: usize = 1568;
 const MLKEM1024_PK_LEN: usize = 1568;
@@ -35,6 +38,49 @@ const ROOT_SECRET_LEN: usize = 32;
 const DEK_LEN: usize = 32;
 const ROOT_KEY_ID_LEN: usize = 16;
 const MAX_FILENAME_LEN: usize = 4096;
+
+struct DecryptedArchive {
+    header: Header,
+    original_name: String,
+}
+
+struct TemporaryFile {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl TemporaryFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self, destination: &Path) -> Result<()> {
+        // A hard link publishes the completed inode atomically and fails if the destination
+        // appeared after our earlier collision check. This avoids rename's overwrite race.
+        fs::hard_link(&self.path, destination).with_context(|| {
+            format!(
+                "publishing verified temporary output {} as {}",
+                self.path.display(),
+                destination.display()
+            )
+        })?;
+        fs::remove_file(&self.path)
+            .with_context(|| format!("removing temporary output {}", self.path.display()))?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "pqbackup")]
@@ -136,6 +182,13 @@ struct RootKey {
     id: [u8; ROOT_KEY_ID_LEN],
     epoch: u32,
     secret: Zeroizing<[u8; ROOT_SECRET_LEN]>,
+}
+
+struct EncryptedFrame {
+    index: u32,
+    plain_len: usize,
+    is_final: bool,
+    ciphertext: Vec<u8>,
 }
 
 fn main() -> Result<()> {
@@ -303,6 +356,7 @@ fn seal(
     }
 
     let original_len = meta.len();
+    validate_archive_geometry(original_len, chunk_size)?;
     let original_name = input
         .file_name()
         .ok_or_else(|| anyhow!("input has no filename"))?
@@ -335,7 +389,7 @@ fn seal(
 
     let kek = Zeroizing::new(derive_kek(
         shared_secret.as_slice(),
-        &*root_key.secret,
+        &root_key.secret,
         &hkdf_salt,
     )?);
 
@@ -354,7 +408,7 @@ fn seal(
         Aes256Gcm::new_from_slice(kek.as_ref()).map_err(|_| anyhow!("invalid KEK length"))?;
     let encrypted_filename = metadata_cipher
         .encrypt(
-            Nonce::from_slice(&metadata_nonce),
+            &aes_nonce(&metadata_nonce),
             Payload {
                 msg: original_name.as_bytes(),
                 aad: &metadata_aad,
@@ -379,7 +433,7 @@ fn seal(
         Aes256Gcm::new_from_slice(kek.as_ref()).map_err(|_| anyhow!("invalid KEK length"))?;
     let wrapped_dek = wrap_cipher
         .encrypt(
-            Nonce::from_slice(&wrap_nonce),
+            &aes_nonce(&wrap_nonce),
             Payload {
                 msg: dek.as_ref(),
                 aad: &wrap_aad,
@@ -406,8 +460,16 @@ fn seal(
 
     let mut reader =
         BufReader::new(File::open(input).with_context(|| format!("opening {}", input.display()))?);
+    if out_path.exists() {
+        bail!(
+            "refusing to overwrite existing output {}",
+            out_path.display()
+        );
+    }
+    let pending = TemporaryFile::new(temporary_output_path(&out_path)?);
     let mut writer = BufWriter::new(
-        create_new(&out_path).with_context(|| format!("creating {}", out_path.display()))?,
+        create_private_new(&pending.path)
+            .with_context(|| format!("creating temporary output {}", pending.path.display()))?,
     );
 
     writer.write_all(&(header_bytes.len() as u32).to_be_bytes())?;
@@ -438,7 +500,12 @@ fn seal(
             break;
         }
 
-        total += n as u64;
+        total = total
+            .checked_add(n as u64)
+            .ok_or_else(|| anyhow!("plaintext length overflow"))?;
+        if total > original_len {
+            bail!("input grew while being read");
+        }
         let is_final = total == original_len;
 
         write_encrypted_chunk(
@@ -456,6 +523,10 @@ fn seal(
             .ok_or_else(|| anyhow!("too many chunks"))?;
 
         if is_final {
+            let mut extra = [0u8; 1];
+            if reader.read(&mut extra)? != 0 {
+                bail!("input grew while being read");
+            }
             break;
         }
     }
@@ -469,6 +540,9 @@ fn seal(
     }
 
     writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    pending.commit(&out_path)?;
 
     println!("Sealed {} -> {}", input.display(), out_path.display());
     println!("The .pqbk file alone is insufficient to recover the backup.");
@@ -482,12 +556,25 @@ fn open_archive(
     secret_key_path: &Path,
     root_secret_path: &Path,
 ) -> Result<()> {
-    // The filename is encrypted, so recover it before selecting the default output path.
-    let original_name = decrypt_filename(input, secret_key_path, root_secret_path)?;
-    let out_path = output
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(original_name));
+    let requested_output = output.map(PathBuf::from);
+    if let Some(path) = &requested_output
+        && path.exists()
+    {
+        bail!("refusing to overwrite existing output {}", path.display());
+    }
 
+    // A same-directory temporary file permits a single authenticated read even though the
+    // default destination name is encrypted inside the header.
+    let temp_anchor = requested_output
+        .as_deref()
+        .unwrap_or_else(|| Path::new("pqbackup-restore"));
+    let pending = TemporaryFile::new(temporary_output_path(temp_anchor)?);
+    let file = create_private_new(&pending.path)
+        .with_context(|| format!("creating temporary output {}", pending.path.display()))?;
+    let mut writer = BufWriter::new(file);
+
+    let decrypted = decrypt_archive_to(input, secret_key_path, root_secret_path, &mut writer)?;
+    let out_path = requested_output.unwrap_or_else(|| PathBuf::from(decrypted.original_name));
     if out_path.exists() {
         bail!(
             "refusing to overwrite existing output {}",
@@ -495,32 +582,10 @@ fn open_archive(
         );
     }
 
-    let temp_path = temporary_output_path(&out_path)?;
-    let result = (|| -> Result<()> {
-        let file = create_new(&temp_path)
-            .with_context(|| format!("creating temporary output {}", temp_path.display()))?;
-        let mut writer = BufWriter::new(file);
-
-        decrypt_archive_to(input, secret_key_path, root_secret_path, &mut writer)?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        drop(writer);
-
-        // Same-directory rename makes successful restores atomic on normal local filesystems.
-        fs::rename(&temp_path, &out_path).with_context(|| {
-            format!(
-                "renaming verified temporary output {} to {}",
-                temp_path.display(),
-                out_path.display()
-            )
-        })?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    pending.commit(&out_path)?;
 
     println!("Opened {} -> {}", input.display(), out_path.display());
     Ok(())
@@ -528,11 +593,11 @@ fn open_archive(
 
 fn verify_archive(input: &Path, secret_key_path: &Path, root_secret_path: &Path) -> Result<()> {
     let mut sink = std::io::sink();
-    let header = decrypt_archive_to(input, secret_key_path, root_secret_path, &mut sink)?;
+    let decrypted = decrypt_archive_to(input, secret_key_path, root_secret_path, &mut sink)?;
     println!(
         "Verified {}: authenticated {} bytes",
         input.display(),
-        header.original_len
+        decrypted.header.original_len
     );
     Ok(())
 }
@@ -542,7 +607,7 @@ fn decrypt_archive_to<W: Write>(
     secret_key_path: &Path,
     root_secret_path: &Path,
     writer: &mut W,
-) -> Result<Header> {
+) -> Result<DecryptedArchive> {
     let seed_vec = read_exact_sized_secret(secret_key_path, MLKEM_SEED_LEN, "ML-KEM secret seed")?;
 
     let seed = Zeroizing::new(
@@ -558,7 +623,7 @@ fn decrypt_archive_to<W: Write>(
         BufReader::new(File::open(input).with_context(|| format!("opening {}", input.display()))?);
 
     let header_len = read_u32(&mut reader)? as usize;
-    if header_len > 64 * 1024 {
+    if header_len > MAX_HEADER_LEN {
         bail!("unreasonable header length");
     }
 
@@ -574,9 +639,41 @@ fn decrypt_archive_to<W: Write>(
 
     let kek = Zeroizing::new(derive_kek(
         shared_secret.as_slice(),
-        &*root_key.secret,
+        &root_key.secret,
         &header.hkdf_salt,
     )?);
+
+    let metadata_aad = encode_metadata_aad(
+        header.chunk_size,
+        header.original_len,
+        &header.root_key_id,
+        header.root_key_epoch,
+        &header.hkdf_salt,
+        &header.data_nonce_prefix,
+        &header.wrap_nonce,
+        &header.metadata_nonce,
+        &header.kem_ciphertext,
+    )?;
+    let metadata_cipher =
+        Aes256Gcm::new_from_slice(kek.as_ref()).map_err(|_| anyhow!("invalid KEK length"))?;
+    let original_name_bytes = Zeroizing::new(
+        metadata_cipher
+            .decrypt(
+                &aes_nonce(&header.metadata_nonce),
+                Payload {
+                    msg: &header.encrypted_filename,
+                    aad: &metadata_aad,
+                },
+            )
+            .map_err(|_| {
+                anyhow!(
+                    "filename metadata authentication failed: wrong key/root secret or modified archive"
+                )
+            })?,
+    );
+    let original_name =
+        String::from_utf8(original_name_bytes.to_vec()).context("invalid encrypted filename")?;
+    validate_filename(&original_name)?;
 
     let wrap_aad = encode_wrap_aad(
         header.chunk_size,
@@ -596,7 +693,7 @@ fn decrypt_archive_to<W: Write>(
     let dek_vec = Zeroizing::new(
         wrap_cipher
             .decrypt(
-                Nonce::from_slice(&header.wrap_nonce),
+                &aes_nonce(&header.wrap_nonce),
                 Payload {
                     msg: &header.wrapped_dek,
                     aad: &wrap_aad,
@@ -618,71 +715,60 @@ fn decrypt_archive_to<W: Write>(
 
     let mut expected_index: u32 = 0;
     let mut total: u64 = 0;
-    let mut saw_final = false;
 
     loop {
-        let mut frame_header = [0u8; 9];
-        match reader.read_exact(&mut frame_header) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                if saw_final {
-                    break;
-                }
-                bail!("archive truncated before authenticated final chunk");
-            }
-            Err(e) => return Err(e.into()),
+        if u64::from(expected_index) >= MAX_DATA_CHUNKS {
+            bail!("archive exceeds the {MAX_DATA_CHUNKS}-chunk safety limit");
+        }
+        let frame = read_encrypted_frame(&mut reader, header.chunk_size)?
+            .ok_or_else(|| anyhow!("archive truncated before authenticated final chunk"))?;
+
+        if frame.index != expected_index {
+            bail!(
+                "chunk sequence error: expected {expected_index}, got {}",
+                frame.index
+            );
+        }
+        if frame.plain_len == 0 && (!frame.is_final || header.original_len != 0) {
+            bail!("empty chunks are only valid as the final frame of an empty archive");
         }
 
-        let index = u32::from_be_bytes(frame_header[0..4].try_into().unwrap());
-        let plain_len = u32::from_be_bytes(frame_header[4..8].try_into().unwrap()) as usize;
-        let flags = frame_header[8];
-        if flags & !0x01 != 0 {
-            bail!("unsupported chunk flags");
-        }
-        let is_final = flags & 0x01 != 0;
-
-        if index != expected_index {
-            bail!("chunk sequence error: expected {expected_index}, got {index}");
-        }
-        if plain_len > header.chunk_size as usize {
-            bail!("chunk exceeds declared chunk size");
-        }
-
-        let mut ciphertext = vec![0u8; plain_len + GCM_TAG_LEN];
-        reader
-            .read_exact(&mut ciphertext)
-            .context("archive truncated inside chunk")?;
-
-        let nonce_bytes = chunk_nonce(&header.data_nonce_prefix, index);
-        let aad = chunk_aad(&header_hash, index, plain_len as u32, is_final);
+        let nonce_bytes = chunk_nonce(&header.data_nonce_prefix, frame.index);
+        let aad = chunk_aad(
+            &header_hash,
+            frame.index,
+            frame.plain_len as u32,
+            frame.is_final,
+        );
 
         let plaintext = Zeroizing::new(
             cipher
                 .decrypt(
-                    Nonce::from_slice(&nonce_bytes),
+                    &aes_nonce(&nonce_bytes),
                     Payload {
-                        msg: &ciphertext,
+                        msg: &frame.ciphertext,
                         aad: &aad,
                     },
                 )
-                .map_err(|_| anyhow!("authentication failed on chunk {index}"))?,
+                .map_err(|_| anyhow!("authentication failed on chunk {}", frame.index))?,
         );
 
         writer.write_all(plaintext.as_ref())?;
-        total += plaintext.len() as u64;
+        total = total
+            .checked_add(plaintext.len() as u64)
+            .ok_or_else(|| anyhow!("decrypted length overflow"))?;
+        if total > header.original_len {
+            bail!("decrypted data exceeds declared original length");
+        }
         expected_index = expected_index
             .checked_add(1)
             .ok_or_else(|| anyhow!("too many chunks"))?;
 
-        if is_final {
-            saw_final = true;
+        if frame.is_final {
             break;
         }
     }
 
-    if !saw_final {
-        bail!("missing authenticated final chunk");
-    }
     if total != header.original_len {
         bail!(
             "decrypted length mismatch: expected {}, got {}",
@@ -696,57 +782,16 @@ fn decrypt_archive_to<W: Write>(
         bail!("unexpected trailing data after final chunk");
     }
 
-    Ok(header)
-}
-
-fn decrypt_filename(
-    input: &Path,
-    secret_key_path: &Path,
-    root_secret_path: &Path,
-) -> Result<String> {
-    let seed_vec = read_exact_sized_secret(secret_key_path, MLKEM_SEED_LEN, "ML-KEM secret seed")?;
-    let seed = Zeroizing::new(
-        <[u8; MLKEM_SEED_LEN]>::try_from(seed_vec.as_slice())
-            .map_err(|_| anyhow!("invalid ML-KEM seed length"))?,
-    );
-    let root_key = read_root_key(root_secret_path)?;
-    let header = read_header_from_file(input)?;
-    ensure_root_metadata(&header, &root_key)?;
-    let dk = DecapsulationKey::new_from_slice(seed.as_ref())
-        .map_err(|_| anyhow!("invalid ML-KEM secret seed"))?;
-    let shared_secret = dk
-        .decapsulate_slice(&header.kem_ciphertext)
-        .map_err(|_| anyhow!("invalid ML-KEM ciphertext"))?;
-    let kek = Zeroizing::new(derive_kek(
-        shared_secret.as_slice(),
-        &*root_key.secret,
-        &header.hkdf_salt,
-    )?);
-    let cipher =
-        Aes256Gcm::new_from_slice(kek.as_ref()).map_err(|_| anyhow!("invalid KEK length"))?;
-    let aad = encode_metadata_aad(
-        header.chunk_size,
-        header.original_len,
-        &header.root_key_id,
-        header.root_key_epoch,
-        &header.hkdf_salt,
-        &header.data_nonce_prefix,
-        &header.wrap_nonce,
-        &header.metadata_nonce,
-        &header.kem_ciphertext,
-    )?;
-    let name = Zeroizing::new(cipher.decrypt(Nonce::from_slice(&header.metadata_nonce),
-        Payload { msg: &header.encrypted_filename, aad: &aad })
-        .map_err(|_| anyhow!("filename metadata authentication failed: wrong key/root secret or modified archive"))?);
-    let name = String::from_utf8(name.to_vec()).context("invalid encrypted filename")?;
-    validate_filename(&name)?;
-    Ok(name)
+    Ok(DecryptedArchive {
+        header,
+        original_name,
+    })
 }
 
 fn read_header_from_file(input: &Path) -> Result<Header> {
     let mut reader = BufReader::new(File::open(input)?);
     let header_len = read_u32(&mut reader)? as usize;
-    if header_len > 64 * 1024 {
+    if header_len > MAX_HEADER_LEN {
         bail!("unreasonable header length");
     }
     let mut header_bytes = vec![0u8; header_len];
@@ -808,6 +853,8 @@ fn derive_kek(shared: &[u8], root: &[u8; ROOT_SECRET_LEN], salt: &[u8; 32]) -> R
     Ok(kek)
 }
 
+// Keeping each authenticated field explicit makes the byte-level format reviewable.
+#[allow(clippy::too_many_arguments)]
 fn encode_wrap_aad(
     chunk_size: u32,
     original_len: u64,
@@ -840,6 +887,7 @@ fn encode_wrap_aad(
     Ok(v)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_metadata_aad(
     chunk_size: u32,
     original_len: u64,
@@ -866,6 +914,7 @@ fn encode_metadata_aad(
     Ok(v)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_public_header(
     chunk_size: u32,
     original_len: u64,
@@ -959,6 +1008,7 @@ fn decode_header(bytes: &[u8]) -> Result<Header> {
     }
 
     let original_len = c.u64()?;
+    validate_archive_geometry(original_len, chunk_size)?;
     let root_key_id: [u8; ROOT_KEY_ID_LEN] = c.take(ROOT_KEY_ID_LEN)?.try_into().unwrap();
     let root_key_epoch = c.u32()?;
 
@@ -974,7 +1024,7 @@ fn decode_header(bytes: &[u8]) -> Result<Header> {
     let kem_ciphertext = c.take(kem_len)?.to_vec();
 
     let filename_len = c.u16()? as usize;
-    if filename_len < GCM_TAG_LEN || filename_len > MAX_FILENAME_LEN + GCM_TAG_LEN {
+    if !(GCM_TAG_LEN..=MAX_FILENAME_LEN + GCM_TAG_LEN).contains(&filename_len) {
         bail!("invalid encrypted filename length");
     }
     let encrypted_filename = c.take(filename_len)?.to_vec();
@@ -1018,7 +1068,7 @@ fn write_encrypted_chunk<W: Write>(
 
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce_bytes),
+            &aes_nonce(&nonce_bytes),
             Payload {
                 msg: plaintext,
                 aad: &aad,
@@ -1038,6 +1088,10 @@ fn chunk_nonce(prefix: &[u8; 8], index: u32) -> [u8; 12] {
     nonce[..8].copy_from_slice(prefix);
     nonce[8..].copy_from_slice(&index.to_be_bytes());
     nonce
+}
+
+fn aes_nonce(bytes: &[u8; 12]) -> Nonce<aes_gcm::aead::consts::U12> {
+    (*bytes).into()
 }
 
 fn chunk_aad(header_hash: &[u8], index: u32, plain_len: u32, is_final: bool) -> Vec<u8> {
@@ -1062,12 +1116,62 @@ fn read_chunk<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
     Ok(filled)
 }
 
+fn read_encrypted_frame<R: Read>(
+    reader: &mut R,
+    chunk_size: u32,
+) -> Result<Option<EncryptedFrame>> {
+    let mut frame_header = [0u8; 9];
+    if reader.read(&mut frame_header[..1])? == 0 {
+        return Ok(None);
+    }
+    reader
+        .read_exact(&mut frame_header[1..])
+        .context("archive truncated inside frame header")?;
+
+    let index = u32::from_be_bytes(frame_header[0..4].try_into().unwrap());
+    let plain_len = u32::from_be_bytes(frame_header[4..8].try_into().unwrap()) as usize;
+    let flags = frame_header[8];
+    if flags & !0x01 != 0 {
+        bail!("unsupported chunk flags");
+    }
+    if plain_len > chunk_size as usize || plain_len > MAX_CHUNK as usize {
+        bail!("chunk exceeds declared chunk size");
+    }
+    let ciphertext_len = plain_len
+        .checked_add(GCM_TAG_LEN)
+        .ok_or_else(|| anyhow!("chunk ciphertext length overflow"))?;
+    let mut ciphertext = vec![0u8; ciphertext_len];
+    reader
+        .read_exact(&mut ciphertext)
+        .context("archive truncated inside chunk")?;
+
+    Ok(Some(EncryptedFrame {
+        index,
+        plain_len,
+        is_final: flags & 0x01 != 0,
+        ciphertext,
+    }))
+}
+
 fn create_new(path: &Path) -> Result<File> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .map_err(Into::into)
+}
+
+fn create_private_new(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    options.open(path).map_err(Into::into)
 }
 
 fn write_new_file(path: &Path, data: &[u8], secret: bool) -> Result<()> {
@@ -1127,6 +1231,10 @@ fn read_root_key(path: &Path) -> Result<RootKey> {
     let data = Zeroizing::new(
         fs::read(path).with_context(|| format!("reading root secret from {}", path.display()))?,
     );
+    decode_root_key(&data)
+}
+
+fn decode_root_key(data: &[u8]) -> Result<RootKey> {
     let expected = 8 + 2 + ROOT_KEY_ID_LEN + 4 + ROOT_SECRET_LEN;
     if data.len() != expected {
         bail!(
@@ -1171,11 +1279,33 @@ fn root_key_id_hex(id: &[u8; ROOT_KEY_ID_LEN]) -> String {
 fn validate_filename(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > MAX_FILENAME_LEN
+        || name == "."
+        || name == ".."
+        || name.as_bytes().contains(&0)
         || Path::new(name).file_name().and_then(|n| n.to_str()) != Some(name)
     {
         bail!("encrypted filename is not a safe single path component");
     }
     Ok(())
+}
+
+fn validate_archive_geometry(original_len: u64, chunk_size: u32) -> Result<u64> {
+    if chunk_size == 0 || chunk_size > MAX_CHUNK {
+        bail!("chunk size must be between 1 and {MAX_CHUNK} bytes");
+    }
+    if original_len > MAX_PLAINTEXT_LEN {
+        bail!("original length exceeds the {MAX_PLAINTEXT_LEN}-byte safety limit");
+    }
+
+    let chunk_count = if original_len == 0 {
+        1
+    } else {
+        original_len.div_ceil(u64::from(chunk_size))
+    };
+    if chunk_count > MAX_DATA_CHUNKS {
+        bail!("archive would exceed the {MAX_DATA_CHUNKS}-chunk safety limit");
+    }
+    Ok(chunk_count)
 }
 
 fn ensure_root_metadata(header: &Header, root_key: &RootKey) -> Result<()> {
@@ -1200,7 +1330,7 @@ impl<'a> Cursor<'a> {
         Self { b, p: 0 }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.p.checked_add(n).map_or(true, |e| e > self.b.len()) {
+        if self.p.checked_add(n).is_none_or(|e| e > self.b.len()) {
             bail!("truncated header");
         }
         let out = &self.b[self.p..self.p + n];
@@ -1224,6 +1354,31 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::HashSet,
+        io,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Result<Self> {
+            let sequence = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("pqbackup-test-{}-{sequence}", std::process::id()));
+            fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     struct VectorData {
         archive: Vec<u8>,
@@ -1270,7 +1425,7 @@ mod tests {
         let cipher = Aes256Gcm::new_from_slice(&kek).unwrap();
         let metadata_ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&metadata_nonce),
+                &aes_nonce(&metadata_nonce),
                 Payload {
                     msg: filename.as_bytes(),
                     aad: &metadata_aad,
@@ -1292,7 +1447,7 @@ mod tests {
         .unwrap();
         let wrapped_dek = cipher
             .encrypt(
-                Nonce::from_slice(&wrap_nonce),
+                &aes_nonce(&wrap_nonce),
                 Payload {
                     msg: &dek,
                     aad: &wrap_aad,
@@ -1374,6 +1529,25 @@ mod tests {
 
     fn digest_hex<D: Digest + Default>(bytes: &[u8]) -> String {
         hex(&D::digest(bytes))
+    }
+
+    fn write_test_keys(dir: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+        let (dk, ek) = MlKem1024::generate_keypair();
+        let seed = dk
+            .to_seed()
+            .ok_or_else(|| anyhow!("test key did not retain a seed"))?;
+        let public_path = dir.join("test.mlkem1024.pub");
+        let secret_path = dir.join("test.mlkem1024.seed");
+        let root_path = dir.join("test.root.key");
+        write_new_file(&public_path, ek.to_bytes().as_slice(), false)?;
+        write_new_file(&secret_path, seed.as_slice(), true)?;
+        let root = RootKey {
+            id: test_bytes::<ROOT_KEY_ID_LEN>(0x20),
+            epoch: 7,
+            secret: Zeroizing::new(test_bytes::<ROOT_SECRET_LEN>(0x40)),
+        };
+        write_new_file(&root_path, &encode_root_key(&root), true)?;
+        Ok((public_path, secret_path, root_path))
     }
 
     #[test]
@@ -1506,5 +1680,229 @@ mod tests {
         let mut trailing_header_byte = header.to_vec();
         trailing_header_byte.push(0);
         assert!(decode_header(&trailing_header_byte).is_err());
+    }
+
+    #[test]
+    fn header_encoding_round_trips_canonical_vectors() {
+        for (filename, plaintext, chunk_size) in [
+            ("empty.txt", &b""[..], 16),
+            ("backup.txt", &b"round trip"[..], 4),
+            ("café-数据.txt", &b"unicode"[..], 64),
+        ] {
+            let vector = build_deterministic_vector(filename, plaintext, chunk_size);
+            let decoded = decode_header(&vector.header).unwrap();
+            assert_eq!(encode_header(&decoded).unwrap(), vector.header);
+        }
+    }
+
+    #[test]
+    fn archive_geometry_enforces_size_and_chunk_limits() {
+        assert_eq!(validate_archive_geometry(0, MAX_CHUNK).unwrap(), 1);
+        assert_eq!(
+            validate_archive_geometry(MAX_PLAINTEXT_LEN, MAX_CHUNK).unwrap(),
+            MAX_PLAINTEXT_LEN / u64::from(MAX_CHUNK)
+        );
+        assert!(validate_archive_geometry(MAX_PLAINTEXT_LEN + 1, MAX_CHUNK).is_err());
+        assert!(validate_archive_geometry(MAX_DATA_CHUNKS, 1).is_ok());
+        assert!(validate_archive_geometry(MAX_DATA_CHUNKS + 1, 1).is_err());
+        assert!(validate_archive_geometry(1, 0).is_err());
+        assert!(validate_archive_geometry(1, MAX_CHUNK + 1).is_err());
+    }
+
+    #[test]
+    fn data_nonces_are_unique_at_supported_boundaries() {
+        let prefix = [0xa5; 8];
+        let indices = [
+            0,
+            1,
+            2,
+            MAX_DATA_CHUNKS as u32 - 2,
+            MAX_DATA_CHUNKS as u32 - 1,
+        ];
+        let nonces: HashSet<[u8; 12]> = indices
+            .into_iter()
+            .map(|index| chunk_nonce(&prefix, index))
+            .collect();
+        assert_eq!(nonces.len(), indices.len());
+        assert_eq!(&chunk_nonce(&prefix, 0)[..8], &prefix);
+    }
+
+    #[test]
+    fn filename_validation_blocks_path_escape_without_normalizing_unicode() {
+        for invalid in ["", ".", "..", "a/b", "/absolute", "nul\0name"] {
+            assert!(validate_filename(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(validate_filename("café-数据.txt").is_ok());
+        #[cfg(unix)]
+        assert!(validate_filename("backslash\\is-a-name-on-unix").is_ok());
+    }
+
+    #[test]
+    fn end_to_end_empty_and_multi_chunk_archives() -> Result<()> {
+        let dir = TestDir::new()?;
+        let (public, secret, root) = write_test_keys(&dir.0)?;
+
+        for (name, contents, chunk_size) in [
+            ("empty.txt", Vec::new(), 16),
+            ("multi.bin", (0u8..40).collect(), 13),
+        ] {
+            let input = dir.0.join(name);
+            let archive = dir.0.join(format!("{name}.pqbk"));
+            let restored = dir.0.join(format!("restored-{name}"));
+            write_new_file(&input, &contents, false)?;
+            seal(&input, Some(&archive), &public, &root, chunk_size)?;
+            verify_archive(&archive, &secret, &root)?;
+            open_archive(&archive, Some(&restored), &secret, &root)?;
+            assert_eq!(fs::read(&restored)?, contents);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(fs::metadata(&restored)?.permissions().mode() & 0o777, 0o600);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn modified_truncated_and_wrong_key_archives_fail_closed() -> Result<()> {
+        let dir = TestDir::new()?;
+        let (public, secret, root) = write_test_keys(&dir.0)?;
+        let input = dir.0.join("input.bin");
+        let archive = dir.0.join("input.pqbk");
+        write_new_file(&input, &(0u8..64).collect::<Vec<_>>(), false)?;
+        seal(&input, Some(&archive), &public, &root, 13)?;
+
+        let original = fs::read(&archive)?;
+        let header_len = u32::from_be_bytes(original[..4].try_into().unwrap()) as usize;
+        for (case, bytes) in [
+            ("header", {
+                let mut value = original.clone();
+                value[4 + 48] ^= 1;
+                value
+            }),
+            ("frame", {
+                let mut value = original.clone();
+                value[4 + header_len + 9] ^= 1;
+                value
+            }),
+            ("truncated", original[..original.len() - 1].to_vec()),
+        ] {
+            let malformed = dir.0.join(format!("{case}.pqbk"));
+            fs::write(&malformed, bytes)?;
+            assert!(
+                verify_archive(&malformed, &secret, &root).is_err(),
+                "{case}"
+            );
+        }
+
+        let other_root = dir.0.join("other.root.key");
+        let root_key = RootKey {
+            id: test_bytes::<ROOT_KEY_ID_LEN>(0x21),
+            epoch: 7,
+            secret: Zeroizing::new(test_bytes::<ROOT_SECRET_LEN>(0x41)),
+        };
+        write_new_file(&other_root, &encode_root_key(&root_key), true)?;
+        assert!(verify_archive(&archive, &secret, &other_root).is_err());
+
+        let other_keys = dir.0.join("other-keys");
+        fs::create_dir(&other_keys)?;
+        let (_, other_secret, _) = write_test_keys(&other_keys)?;
+        assert!(verify_archive(&archive, &other_secret, &root).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_collision_and_authentication_failure_leave_no_partial_output() -> Result<()> {
+        let dir = TestDir::new()?;
+        let (public, secret, root) = write_test_keys(&dir.0)?;
+        let input = dir.0.join("input.txt");
+        let archive = dir.0.join("input.pqbk");
+        let output = dir.0.join("output.txt");
+        write_new_file(&input, b"authenticated contents", false)?;
+        seal(&input, Some(&archive), &public, &root, 8)?;
+
+        write_new_file(&output, b"do not replace", false)?;
+        assert!(open_archive(&archive, Some(&output), &secret, &root).is_err());
+        assert_eq!(fs::read(&output)?, b"do not replace");
+        fs::remove_file(&output)?;
+
+        let mut damaged = fs::read(&archive)?;
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        let damaged_path = dir.0.join("damaged.pqbk");
+        fs::write(&damaged_path, damaged)?;
+        assert!(open_archive(&damaged_path, Some(&output), &secret, &root).is_err());
+        assert!(!output.exists());
+        assert!(fs::read_dir(&dir.0)?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("output.txt.")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn publication_race_never_replaces_destination() -> Result<()> {
+        let dir = TestDir::new()?;
+        let temp_path = dir.0.join(".pending.tmp");
+        let destination = dir.0.join("destination");
+        write_new_file(&temp_path, b"new", false)?;
+        let pending = TemporaryFile::new(temp_path.clone());
+        write_new_file(&destination, b"existing", false)?;
+        assert!(pending.commit(&destination).is_err());
+        assert_eq!(fs::read(&destination)?, b"existing");
+        assert!(!temp_path.exists());
+        Ok(())
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "simulated full disk",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn output_write_failure_is_reported() -> Result<()> {
+        let dir = TestDir::new()?;
+        let vector = build_deterministic_vector("backup.txt", b"payload", 64);
+        let archive = dir.0.join("vector.pqbk");
+        let seed_path = dir.0.join("seed");
+        let root_path = dir.0.join("root");
+        fs::write(&archive, vector.archive)?;
+        fs::write(&seed_path, test_bytes::<MLKEM_SEED_LEN>(0x00))?;
+        let root = RootKey {
+            id: test_bytes::<ROOT_KEY_ID_LEN>(0x60),
+            epoch: 0x0102_0304,
+            secret: Zeroizing::new(test_bytes::<ROOT_SECRET_LEN>(0x70)),
+        };
+        fs::write(&root_path, encode_root_key(&root))?;
+        assert!(decrypt_archive_to(&archive, &seed_path, &root_path, &mut FailingWriter).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn header_parser_rejects_every_truncated_prefix_without_panicking() {
+        let archive = fixture_hex(include_str!("../test-vectors/one-chunk.pqbk.hex"));
+        let header_len = u32::from_be_bytes(archive[..4].try_into().unwrap()) as usize;
+        let header = &archive[4..4 + header_len];
+        for length in 0..header.len() {
+            assert!(decode_header(&header[..length]).is_err(), "length {length}");
+        }
+
+        let mut excessive_length = header.to_vec();
+        excessive_length[20..28].copy_from_slice(&(MAX_PLAINTEXT_LEN + 1).to_be_bytes());
+        assert!(decode_header(&excessive_length).is_err());
     }
 }

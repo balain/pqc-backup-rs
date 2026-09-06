@@ -1,13 +1,13 @@
 # Supported limits and environments
 
-**Status:** Phase 0 policy baseline. “Current” values are enforced today; “target” values are approved implementation goals for Phase 2.
+**Status:** Phase 2 enforced baseline (2026-09-06).
 
 ## Supported environment
 
 The security-supported development scope is:
 
 - 64-bit macOS and Linux;
-- regular local files on filesystems providing reliable same-directory rename;
+- regular local files on filesystems providing reliable same-directory hard links;
 - an operating system CSPRNG available through `getrandom`;
 - a current Rust toolchain capable of building the locked dependencies.
 
@@ -22,9 +22,11 @@ The current Unix implementation sets newly written secret files to mode `0600`. 
 | Archive magic/version | `PQBACK02`, version 2 only |
 | Root-key format | `PQROOT02`, 62 bytes |
 | Header length | At most 64 KiB |
+| Plaintext length | At most 1 TiB (1,099,511,627,776 bytes) |
 | Chunk size | 1 byte through 16 MiB |
 | Default chunk size | 4 MiB |
-| Chunk index | 32-bit unsigned; overflow fails |
+| Data frames per archive | At most 1,048,576 (2^20) |
+| Chunk index | Sequential 32-bit unsigned; Phase 2 count limit applies first |
 | Original filename | UTF-8, safe single component, at most 4096 bytes before encryption |
 | ML-KEM ciphertext | Exactly 1568 bytes |
 | ML-KEM public key | Exactly 1568 bytes |
@@ -33,23 +35,21 @@ The current Unix implementation sets newly written secret files to mode `0600`. 
 | Wrapped DEK | 32-byte DEK plus 16-byte GCM tag |
 | Existing output | Never overwritten |
 | Trailing archive data | Rejected after authenticated final chunk |
+| Restore/archive temporary files | Same destination directory, mode `0600` on Unix, removed on failure when the OS permits |
 
-## Known current gap
+The smaller applicable plaintext/chunk-count limit wins. For example, one-byte
+chunks reach the frame-count limit at 1 MiB, while the default 4 MiB chunk size
+reaches the 1 TiB plaintext limit first.
 
-There is no explicit maximum plaintext size or conservative maximum chunk count below the 32-bit framing boundary. Therefore very large archives are not security-supported even if the program can process them.
+All header-derived allocations are bounded by the 64 KiB header ceiling. Each
+frame allocation is bounded by 16 MiB of plaintext plus its 16-byte AEAD tag.
+Length totals and allocation sizes use checked arithmetic.
 
-## Approved Phase 2 targets
+## Limit-change policy
 
-Phase 2 will implement both limits; the smaller applicable limit wins:
-
-- maximum plaintext size: **1 TiB**;
-- maximum data chunks under one DEK: **1,048,576 (2^20)**;
-- maximum allocation derived from header-controlled data: **64 KiB**;
-- maximum chunk allocation: **16 MiB plus authentication framing**.
-
-These are conservative engineering ceilings, not a claim that every file up to the ceiling has a particular formal security strength. Phase 2 must validate them against the final AES-GCM analysis and lower them if that review requires it. Raising them requires a documented security analysis, tests, and a versioned policy update.
-
-Until Phase 2 enforcement lands, operators must keep each input at or below 1 TiB and choose a chunk size that produces no more than 2^20 chunks. A 4 MiB chunk size reaches the plaintext-size ceiling first.
+These are conservative engineering ceilings, not a claim that every file up to
+the ceiling has a particular formal security strength. Raising them requires a
+documented security analysis, boundary tests, and a versioned policy update.
 
 ## Retention policy
 
@@ -66,7 +66,6 @@ A 10–30 year archive is a managed migration objective, not a promise that one 
 
 ## Filesystem requirements
 
-Recovery's final rename is only assumed atomic when the temporary file and output are in the same directory on a conforming local filesystem. Durability across power loss is not claimed for every filesystem. Verify restored output and application-level contents after recovery.
+Recovery's no-replace publication is only assumed atomic when the temporary file and output are in the same directory on a conforming local filesystem with hard-link support. Durability across power loss is not claimed for every filesystem. Verify restored output and application-level contents after recovery.
 
 Secure deletion is not provided. Removing plaintext from SSDs, snapshots, backups, swap, or copy-on-write filesystems is outside the package boundary.
-

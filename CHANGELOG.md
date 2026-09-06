@@ -4,6 +4,19 @@ All notable security-relevant and user-visible changes are recorded here.
 
 ## Unreleased
 
+## 0.0.2 - 2026-09-06
+
+### Phase 2 hostile-input hardening
+
+- Enforced maximum plaintext size of 1 TiB and at most 2^20 data frames per archive.
+- Added checked arithmetic and bounded all archive-controlled header and frame allocations.
+- Changed seal and restore to use restrictive same-directory temporary files, atomic no-replace publication, overwrite refusal, and failure cleanup.
+- Reduced restore to one archive/KEM pass while keeping the encrypted filename as the default destination.
+- Replaced deprecated AES-GCM nonce construction and enabled warning-free lint/build gates.
+- Tightened filename validation without changing the frozen v2 Unicode byte representation.
+- Added end-to-end, limit, corruption, truncation, key mismatch, path, collision, permission, storage-failure, and nonce-uniqueness tests.
+- Added production-parser fuzz targets for headers, root keys, and frame traversal plus CI fuzz smoke runs.
+
 ### Phase 1 format baseline
 
 - Froze byte-level specifications for `PQBACK02` and `PQROOT02`.
