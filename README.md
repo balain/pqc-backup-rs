@@ -26,6 +26,8 @@ Security policy and planning documents:
 - [Improvement plan](docs/IMPROVEMENT_PLAN.md)
 - [Parser fuzzing](docs/FUZZING.md)
 - [Deterministic test vectors](test-vectors/manifest.md)
+- [Release process](docs/RELEASE_PROCESS.md)
+- [Recovery runbook](docs/RECOVERY_RUNBOOK.md)
 
 ## Quick start: run the complete demo
 
@@ -74,7 +76,8 @@ long-lived archival data rather than ML-KEM-768.
 
 ## Build
 
-Requires a current Rust toolchain:
+The repository pins Rust 1.97.1 in `rust-toolchain.toml`. With `rustup`
+installed, Cargo selects and installs that toolchain automatically:
 
 ```bash
 cargo build --release
@@ -91,25 +94,41 @@ For development, replace `target/release/pqbackup` below with
 
 ## Download a tagged release
 
-Pushing a new `v*` tag runs the complete test and fuzz-smoke workflow. After
-those checks pass, GitHub Actions creates a GitHub Release containing:
+Pushing a new `v*` tag runs the complete test, supply-chain, fuzz-smoke,
+reproducibility, and offline-recovery workflow. After those checks pass,
+GitHub Actions creates a GitHub Release containing:
 
 ```text
 pqbackup-vX.Y.Z-linux-x86_64.tar.gz
-pqbackup-vX.Y.Z-linux-x86_64.tar.gz.sha256
+pqbackup-vX.Y.Z-macos-x86_64.tar.gz
+pqbackup-vX.Y.Z-macos-aarch64.tar.gz
+pqbackup-vX.Y.Z-source.tar.gz
+pqbackup-vX.Y.Z-recovery-kit.tar.gz
+pqbackup-vX.Y.Z.cdx.json
+pqbackup-vX.Y.Z-release-manifest.txt
+pqbackup-vX.Y.Z-trusted-root.jsonl
+pqbackup-vX.Y.Z-provenance.sigstore.json
+SHA256SUMS
 ```
 
-Download both files from the repository's Releases page, verify the checksum,
-and extract the executable:
+Download the assets from the repository's Releases page, verify the checksum
+manifest and build provenance, then extract the binary for your platform:
 
 ```bash
-sha256sum -c pqbackup-vX.Y.Z-linux-x86_64.tar.gz.sha256
+shasum -a 256 -c SHA256SUMS
+gh attestation verify \
+  pqbackup-vX.Y.Z-linux-x86_64.tar.gz \
+  -R OWNER/REPOSITORY \
+  --bundle pqbackup-vX.Y.Z-provenance.sigstore.json
 tar -xzf pqbackup-vX.Y.Z-linux-x86_64.tar.gz
 ./pqbackup --help
 ```
 
-The automated release currently provides Linux x86-64. Build from source for
-macOS or other development environments within the supported scope.
+Use `macos-aarch64` for Apple silicon and `macos-x86_64` for Intel macOS.
+Preserve the recovery kit, detached provenance bundle, trusted-root file, and
+checksum manifest together. The [recovery runbook](docs/RECOVERY_RUNBOOK.md)
+documents online and offline verification, rebuilding, test-vector recovery,
+media refresh, and migration drills.
 
 ## Command reference
 

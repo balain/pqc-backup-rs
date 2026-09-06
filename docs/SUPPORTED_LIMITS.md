@@ -1,6 +1,6 @@
 # Supported limits and environments
 
-**Status:** Phase 2 enforced baseline (2026-09-06).
+**Status:** Phase 4 release baseline (2026-09-06).
 
 ## Supported environment
 
@@ -9,7 +9,7 @@ The security-supported development scope is:
 - 64-bit macOS and Linux;
 - regular local files on filesystems providing reliable same-directory hard links;
 - an operating system CSPRNG available through `getrandom`;
-- a current Rust toolchain capable of building the locked dependencies.
+- the pinned Rust 1.97.1 toolchain when rebuilding release 0.0.4.
 
 Windows, network filesystems, cloud-synchronized folders, FUSE filesystems, object-store mounts, unusual removable-media filesystems, containers with weak entropy, and 32-bit targets are not security-supported yet. They may work, but file permissions, atomic publication, durability, and failure behavior have not been validated.
 
@@ -64,6 +64,11 @@ The cryptography is intended for long-lived archives, but no passive retention d
 - preservation of source, lockfile, known-good binary, specifications, test vectors, and restore instructions.
 
 A 10–30 year archive is a managed migration objective, not a promise that one binary and format can be ignored for that period.
+
+Tagged releases provide native binaries for Linux x86-64, Intel macOS, and
+Apple-silicon macOS. The pipeline performs same-host byte comparison for clean
+builds; it does not claim cross-host or cross-toolchain bit-for-bit identity.
+The recovery kit supplies vendored dependencies for locked offline builds.
 
 ## Filesystem requirements
 

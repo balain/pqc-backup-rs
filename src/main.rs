@@ -2090,6 +2090,10 @@ mod tests {
 
     #[test]
     fn deterministic_phase1_vectors_match_fixtures() {
+        assert_eq!(
+            fixture_hex(include_str!("../test-vectors/mlkem-seed.hex")),
+            test_bytes::<MLKEM_SEED_LEN>(0x00)
+        );
         let cases: Vec<(&str, String, Vec<u8>, u32)> = vec![
             ("empty", "empty.txt".into(), vec![], 16),
             (

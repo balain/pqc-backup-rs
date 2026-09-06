@@ -4,7 +4,7 @@
 **Basis:** [Long-term security assessment](./LONG_TERM_SECURITY_ASSESSMENT.md)  
 **Current format:** `PQBACK02` archives and `PQROOT02` root keys
 
-**Phase status:** Phases 0, 1, and 2 completed on 2026-09-06. Phase 3 engineering completed on 2026-09-06; its operator recovery-drill gate remains pending. Later phases remain planned.
+**Phase status:** Phases 0, 1, and 2 completed on 2026-09-06. Phase 3 engineering completed on 2026-09-06; its operator recovery-drill gate remains pending. Phase 4 engineering completed on 2026-09-06; signed-tag, two-person verification, separate-copy, and scheduled-owner gates remain pending. Later phases remain planned.
 
 ## Objective
 
@@ -211,6 +211,15 @@ custody copies in their deployment environment.
 **Estimated effort:** M–L.
 
 ## Phase 4 — Build a durable release and recovery process
+
+**Engineering status:** Completed on 2026-09-06. The repository now pins build
+inputs, checks dependency advisories/licenses/sources, builds and compares each
+supported native binary twice, emits an SBOM and manifests, publishes attested
+multi-platform assets, and validates a vendored source tree with Cargo offline.
+The recovery and release runbooks define drills and preservation schedules.
+Operational exit criteria require approved tag-signing credentials, two human
+verifiers, controlled recovery-kit copies, and named schedule owners; those
+cannot be satisfied by repository changes alone and remain pending.
 
 **Goal:** ensure an archive can still be restored when today’s development environment is gone.
 

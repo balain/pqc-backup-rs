@@ -30,6 +30,7 @@ ML-KEM uses the fixed seed's derived encapsulation key and deterministic test-on
 ## Files
 
 - `one-chunk.pqbk.hex`: complete canonical archive as lowercase hex.
+- `mlkem-seed.hex`: public deterministic ML-KEM seed for offline restore drills.
 - `root-key.hex`: complete canonical `PQROOT02` key file as lowercase hex.
 - `checksums.txt`: plaintext and component/archive hashes for all cases.
 - `negative-vectors.md`: mutations and required error categories.

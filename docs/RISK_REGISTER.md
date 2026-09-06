@@ -17,8 +17,8 @@
 | R-010 | `inspect` metadata may be attacker-controlled | Medium | Mitigated | Operator | CLI/docs label it unauthenticated routing data; recovery AEAD remains authoritative. |
 | R-011 | Secret zeroization cannot prevent swap, dumps, or OS inspection | High | Open | Maintainer | Phase 3 documents host controls and added a non-exportable-provider boundary; memory locking and an approved hardware backend remain open. |
 | R-012 | Filename portability and normalization rules are incomplete | High | Mitigated | Maintainer | Supported scope is macOS/Linux; v2 preserves UTF-8 without normalization and rejects unsafe single-component names, with path-misuse tests. |
-| R-013 | Dependency or build supply-chain compromise | High | Open | Maintainer | Phase 4 pinned toolchain, vulnerability checks, SBOM, signed/reproducible releases. |
-| R-014 | Future environment may not rebuild or run the decoder | Critical | Open | Maintainer | Phase 4 signed recovery kit and offline clean-room restore tests. |
+| R-013 | Dependency or build supply-chain compromise | High | Mitigated | Maintainer | Phase 4 pins tool/action versions, checks advisories/licenses/sources, compares clean native builds, publishes an SBOM, and attests release assets. Maintainer-signed tags remain an operational gate. |
+| R-014 | Future environment may not rebuild or run the decoder | Critical | Mitigated | Maintainer | Phase 4 publishes an attested kit with source, vendored dependencies, toolchain/lock inputs, binaries, vectors, and an offline test. Separate physical copies and human drills remain operator gates. |
 | R-015 | Storage deletion, corruption, or replay remains possible | High | Accepted/deferred | Operator | Independent archive copies and catalogs; provenance option in Phase 5. |
 | R-016 | No formal compliance or cryptographic-module validation | High | Accepted/deferred | Product owner | Prohibit such claims; deployment-specific compliance work after Phase 6. |
 | R-017 | Demo mode intentionally co-locates disposable secrets | Medium | Mitigated | Maintainer | Prominent runtime warning and documentation; demo files must never become production keys. |
@@ -26,6 +26,6 @@
 
 ## Phase 0 disposition
 
-Phase 0 establishes ownership and policy; it does not close risks assigned to later phases. The current release remains experimental. Production consideration is blocked by R-001/R-002/R-003/R-006/R-007/R-011/R-013/R-014 and the independent-review gate.
+Phase 0 establishes ownership and policy; it does not close risks assigned to later phases. The current release remains experimental. Production consideration is blocked by R-001, R-006, R-011, the incomplete Phase 3/4 operational gates, and the independent-review gate.
 
 Review this register whenever a phase completes, a dependency changes, a security report arrives, or a new deployment environment is proposed.

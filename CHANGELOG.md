@@ -4,6 +4,18 @@ All notable security-relevant and user-visible changes are recorded here.
 
 ## Unreleased
 
+## 0.0.4 - 2026-09-06
+
+### Phase 4 durable releases and recovery
+
+- Pinned Rust 1.97.1, the fuzzing nightly/tool, dependency-policy tool, SBOM generator, and every GitHub Action revision.
+- Added continuous advisory, license, dependency-policy, wildcard, and dependency-source checks.
+- Added clean same-host reproducibility checks and native release binaries for Linux x86-64, Intel macOS, and Apple-silicon macOS.
+- Added CycloneDX SBOMs, SHA-256 manifests, GitHub/Sigstore build-provenance attestations, and offline trusted-root preservation.
+- Added a versioned recovery kit with source, vendored dependencies, pinned build inputs, specifications, vectors, platform binaries, and an offline locked test gate.
+- Added release and recovery runbooks with two-person verification, bit-rot, media-refresh, restore-drill, and cryptographic-migration schedules.
+- Added the public deterministic ML-KEM seed fixture needed to exercise the known-good archive from an isolated recovery kit.
+
 ## 0.0.3 - 2026-09-06
 
 ### Release automation

@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "pqbackup"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aes-gcm",
  "anyhow",

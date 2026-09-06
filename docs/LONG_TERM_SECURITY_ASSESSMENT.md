@@ -1,6 +1,6 @@
 # Long-term security assessment
 
-**Assessment date:** 2026-09-05  
+**Assessment date:** 2026-09-05; updated through Phase 4 on 2026-09-06
 **Assessed revision:** `PQBACK02` / `PQROOT02`  
 **Scope:** local archival confidentiality and recoverability. This is a source review, not an independent audit, certification, or security guarantee.
 
@@ -42,7 +42,11 @@ The lockfile selects `ml-kem` 0.3.2. Its own [documentation](https://docs.rs/cra
 
 During sealing, the process can access plaintext, the root key, and derived keys. During recovery, it accesses both recovery secrets and plaintext. Malware, a compromised operating system, a privileged debugger, or malicious backup software at those moments defeats the intended protection.
 
-The code uses `zeroize` for several explicit secret buffers, which is helpful, but cannot guarantee removal of compiler copies, swap, crash dumps, process inspection, or operating-system compromise. There is no memory locking, HSM, smartcard, platform-keystore, or non-exportable-key support.
+The code uses `zeroize` for explicit secret buffers and has a provider boundary
+for future non-exportable root keys. Those controls cannot guarantee removal of
+compiler copies, swap, crash dumps, process inspection, or operating-system
+compromise. There is no memory locking or approved HSM, smartcard, or platform
+keystore backend.
 
 ### Key custody dominates the outcome
 
@@ -58,17 +62,32 @@ AES-GCM authenticates an archive to someone holding the recovery capability; it 
 
 Filename privacy is good, but plaintext length, chunk size, algorithms, root-key ID, and epoch remain visible. Length can expose approximate content type or backup cadence. An attacker can also corrupt clear header data to cause an early failure. Neither issue reveals plaintext, but both matter operationally.
 
-### Immature custom-format assurance
+### Custom-format assurance remains incomplete
 
-The format is bespoke. It has small unit coverage and a command-line demo, but does not yet have a published byte-level specification, stable test vectors, independent implementation, parser fuzzing, corruption corpus, signed release, or dependency-vulnerability CI. Explicit algorithm IDs help future migration but do not implement algorithm agility.
+The format is bespoke. The repository now has byte-level specifications,
+stable positive/negative vectors, end-to-end corruption tests, bounded parser
+fuzzing, dependency-vulnerability CI, native release binaries, SBOMs, and
+attested recovery kits. It still lacks an independent implementation,
+maintainer-signed source tags, sustained external fuzzing, and independent
+security review. Explicit algorithm IDs help future migration but do not
+implement algorithm agility.
 
-### Archive-size bounds need formalization
+### Archive-size bounds are conservative, not formally proven
 
-The 32-bit chunk index prevents nonce wrap by failing on overflow, but the implementation does not enforce a conservative total archive-size or chunk-count limit. GCM has usage bounds as well as nonce-uniqueness requirements. Before supporting very large archives, define and enforce a maximum chunk count and plaintext size based on the chosen chunk size and accepted GCM limits.
+The implementation enforces a 1 TiB plaintext ceiling, a maximum of 2^20 data
+frames, bounded allocations, and a 32-bit sequential chunk index. These limits
+prevent nonce-index wrap and constrain resource use, but they are conservative
+engineering policy rather than a formal security proof for every workload or
+deployment environment.
 
 ### Multi-decade recovery is not automatic
 
-Future recovery needs a compatible decoder, the ML-KEM seed, the matching root key, the format rules, and working dependencies. `Cargo.lock` helps, but no release artifact, formal specification, or preserved test vector is currently part of the recovery plan.
+Future recovery needs a compatible decoder, the ML-KEM seed, the matching root
+key, the format rules, and working dependencies. Tagged releases now include
+native binaries, source, `Cargo.lock`, a pinned toolchain declaration, vendored
+dependencies, specifications, vectors, hashes, an SBOM, and an offline test
+procedure. This materially improves recoverability but only if operators retain
+verified copies and continue scheduled restore and migration drills.
 
 ## Capability matrix
 
@@ -79,21 +98,21 @@ Future recovery needs a compatible decoder, the ML-KEM seed, the matching root k
 | Generic PQ symmetric margin | Approximately 128-bit class | Standard generic quantum-search assumptions. |
 | Content tamper detection | Strong | Complete decoder checks succeed. |
 | Filename privacy | Good | File length and routing metadata remain visible. |
-| Sender identity | Absent | No signature or provenance system exists. |
+| Archive sender identity | Absent | No archive signature or trusted archive-creator identity exists. |
+| Release provenance | Good for tagged artifacts | GitHub/Sigstore attestation and trusted roots are preserved and verified. |
 | Endpoint-compromise resistance | Weak | Secrets/plaintext enter the local process. |
 | Compliance readiness | Insufficient | No validation or independent audit evidence. |
-| Multi-decade recoverability | Moderate to weak | Active preservation and migration are required. |
+| Multi-decade recoverability | Moderate | Attested offline recovery kits exist; active preservation and migration remain required. |
 
 ## Recommended improvements
 
 1. Do not rely on this as the only copy of critical data; maintain independent, tested backups and physically separated recovery materials.
 2. Obtain an independent cryptographic/Rust review of the envelope, parser, error paths, secret handling, and command-line filesystem behavior.
-3. Publish a versioned byte-level format specification, stable test vectors, and known-good release binaries with recovery instructions.
-4. Add end-to-end corruption tests, parser fuzzing, dependency monitoring, reproducible builds, and release/CI policy.
-5. Define and enforce conservative AES-GCM archive-size and chunk-count limits.
-6. Deprecate the combined key-generation flow for production use and consider OS keystores, HSM/smartcard workflows, and memory-locking.
-7. Add a canonical signed envelope only if creator identity and provenance are required, along with signing-key distribution and rotation policy.
-8. Create a scheduled migration procedure: periodically decrypt, verify, and reseal archives with reviewed software while retaining old keys and decoders.
+3. Complete two-person offline restore drills from independently held recovery-kit and key copies.
+4. Establish approved source-tag signing and verify release attestations before distribution.
+5. Implement and review an approved hardware/non-exportable root-key backend if the deployment requires it.
+6. Add a canonical signed envelope only if creator identity and archive provenance are required, along with signing-key distribution and rotation policy.
+7. Execute the scheduled migration procedure: periodically decrypt, verify, and reseal archives with reviewed software while retaining old keys and decoders.
 
 ## Bottom line
 
