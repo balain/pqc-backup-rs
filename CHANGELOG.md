@@ -4,6 +4,10 @@ All notable security-relevant and user-visible changes are recorded here.
 
 ## Unreleased
 
+### Release automation
+
+- Changed `v*` tag builds from temporary Actions artifacts to GitHub Releases with a packaged Linux x86-64 binary and SHA-256 checksum.
+
 ## 0.0.2 - 2026-09-06
 
 ### Phase 2 hostile-input hardening

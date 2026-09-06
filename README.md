@@ -86,6 +86,28 @@ target/release/pqbackup
 For development, replace `target/release/pqbackup` below with
 `cargo run --` or `target/debug/pqbackup`.
 
+## Download a tagged release
+
+Pushing a new `v*` tag runs the complete test and fuzz-smoke workflow. After
+those checks pass, GitHub Actions creates a GitHub Release containing:
+
+```text
+pqbackup-vX.Y.Z-linux-x86_64.tar.gz
+pqbackup-vX.Y.Z-linux-x86_64.tar.gz.sha256
+```
+
+Download both files from the repository's Releases page, verify the checksum,
+and extract the executable:
+
+```bash
+sha256sum -c pqbackup-vX.Y.Z-linux-x86_64.tar.gz.sha256
+tar -xzf pqbackup-vX.Y.Z-linux-x86_64.tar.gz
+./pqbackup --help
+```
+
+The automated release currently provides Linux x86-64. Build from source for
+macOS or other development environments within the supported scope.
+
 ## Command reference
 
 ```text
