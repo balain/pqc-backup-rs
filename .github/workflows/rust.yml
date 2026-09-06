@@ -46,6 +46,8 @@ jobs:
         run: cargo fuzz run decode-root-key -- -runs=1000
       - name: Fuzz frame traversal
         run: cargo fuzz run frame-traversal -- -runs=1000
+      - name: Fuzz inventory decoder
+        run: cargo fuzz run decode-inventory -- -runs=1000
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

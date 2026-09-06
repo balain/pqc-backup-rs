@@ -15,7 +15,9 @@ getrandom = "0.4.3"
 hkdf = "0.13.0"
 libfuzzer-sys = "0.4"
 ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
+serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.11.0"
+toml = "0.9"
 zeroize = { version = "1.8", features = ["derive"] }
 
 [[bin]]
@@ -35,6 +37,13 @@ bench = false
 [[bin]]
 name = "frame-traversal"
 path = "fuzz_targets/frame_traversal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode-inventory"
+path = "fuzz_targets/decode_inventory.rs"
 test = false
 doc = false
 bench = false

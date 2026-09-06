@@ -20,6 +20,8 @@ Security policy and planning documents:
 - [PQROOT02 format](docs/PQROOT02_FORMAT.md)
 - [Compatibility policy](docs/FORMAT_COMPATIBILITY.md)
 - [Decoder error categories](docs/ERROR_CATEGORIES.md)
+- [Key management and custody](docs/KEY_MANAGEMENT.md)
+- [PQINVENTORY01 format](docs/PQINVENTORY01_FORMAT.md)
 - [Long-term security assessment](docs/LONG_TERM_SECURITY_ASSESSMENT.md)
 - [Improvement plan](docs/IMPROVEMENT_PLAN.md)
 - [Parser fuzzing](docs/FUZZING.md)
@@ -33,8 +35,9 @@ After building, run the self-contained demonstration in a new directory:
 target/release/pqbackup demo --out-dir ./pqbackup-demo
 ```
 
-The command creates a harmless sample file, ML-KEM keys, a root key, an
-encrypted archive, and a restored copy. It then compares the restored file to
+The command creates a harmless sample file, ML-KEM keys, a root key, a
+secret-free custody inventory, an encrypted archive, and a restored copy. It
+then locates the archive's inventory entry and compares the restored file to
 the input. It does not overwrite an existing demo directory. The demo keeps
 both recovery secrets together for convenience only; do not copy that custody
 pattern for real backups.
@@ -114,15 +117,27 @@ macOS or other development environments within the supported scope.
 pqbackup keygen-kem  --out-dir DIR [--name NAME]
 pqbackup keygen-root --output PATH [--root-key-id HEX] [--root-key-epoch N]
 pqbackup seal INPUT --public-key PATH --root-secret PATH [-o OUTPUT]
-               [--chunk-size BYTES]
+               [--chunk-size BYTES] [--expect-root-key-id HEX]
+               [--expect-root-key-epoch N]
 pqbackup inspect ARCHIVE.pqbk
+pqbackup key-info PATH --kind root|kem-public|kem-seed|archive
+pqbackup inventory init INVENTORY.toml
+pqbackup inventory add INVENTORY.toml --root-secret PATH --label TEXT
+               --custody TEXT [--custody TEXT] [--status STATUS]
+pqbackup inventory list INVENTORY.toml
+pqbackup inventory check INVENTORY.toml
+pqbackup inventory locate INVENTORY.toml ARCHIVE.pqbk
+pqbackup inventory set-status INVENTORY.toml --root-key-id HEX
+               --root-key-epoch N --status STATUS
 pqbackup verify ARCHIVE.pqbk --secret-key PATH --root-secret PATH
 pqbackup open ARCHIVE.pqbk --secret-key PATH --root-secret PATH [-o OUTPUT]
 pqbackup demo [--out-dir DIR]
 ```
 
-Run `pqbackup <command> --help` for the complete argument help. All commands
-refuse to overwrite files; choose a new output path or move the existing file.
+Run `pqbackup <command> --help` for the complete argument help. Commands that
+create keys, archives, demos, or inventories refuse to overwrite files.
+`inventory add` and `inventory set-status` atomically update an existing
+inventory.
 
 ## One-time setup
 
@@ -162,6 +177,40 @@ The root-key file is binary. Do not open it in an editor, send it by email, or
 treat it as a password string. Existing v1 raw 32-byte root-secret files are
 not valid v2 root-key files: generate a fresh `PQROOT02` root key before
 creating v2 archives.
+
+Validate files and compare the public-key fingerprint derived from both ML-KEM
+files before separating them:
+
+```bash
+pqbackup key-info ./keys/home-archive.mlkem1024.pub --kind kem-public
+pqbackup key-info ./keys/home-archive.mlkem1024.seed --kind kem-seed
+pqbackup key-info /Volumes/ROOTKEY/home-archive.root.key --kind root
+```
+
+The two ML-KEM commands must print the same `public SHA-256` value. `key-info`
+never prints secret bytes.
+
+### Create a custody inventory
+
+The inventory records only root-key IDs, epochs, lifecycle status, labels, and
+human-readable custody locations. Store no passwords, recovery phrases, key
+bytes, PINs, or unlock instructions in it.
+
+```bash
+pqbackup inventory init ./root-key-inventory.toml
+
+pqbackup inventory add ./root-key-inventory.toml \
+  --root-secret /Volumes/ROOTKEY/home-archive.root.key \
+  --label "Home archive annual root" \
+  --custody "Primary sealed offline copy" \
+  --custody "Offsite sealed recovery copy"
+
+pqbackup inventory check ./root-key-inventory.toml
+pqbackup inventory list ./root-key-inventory.toml
+```
+
+The inventory is operationally sensitive even though it contains no key
+material. On supported Unix systems it is created with mode `0600`.
 
 ### Recommended custody
 
@@ -211,8 +260,13 @@ Use `-o` when the archive should have a different name or location:
 pqbackup seal backup-2026-09-05.tgz \
   --output /Volumes/BACKUPS/home-2026-09-05.pqbk \
   --public-key ./keys/home-archive.mlkem1024.pub \
-  --root-secret /Volumes/ROOTKEY/home-archive.root.key
+  --root-secret /Volumes/ROOTKEY/home-archive.root.key \
+  --expect-root-key-id 0c9f1a2b3d4e5f60718293a4b5c6d7e8 \
+  --expect-root-key-epoch 2026
 ```
+
+The expectation flags are recommended in automation. Sealing stops before
+creating an archive when the mounted root key does not match either value.
 
 `--chunk-size` defaults to 4 MiB and accepts values from 1 byte through 16 MiB.
 It changes streaming/memory behavior, not the required recovery materials.
@@ -238,6 +292,12 @@ An inspect result contains attacker-controlled, unauthenticated routing data
 until recovery keys validate the archive. It is not proof of the root key,
 epoch, creator, or archive history. Archive length and root-key ID/epoch may
 also be operationally sensitive.
+
+Locate the matching custody record without mounting either recovery secret:
+
+```bash
+pqbackup inventory locate ./root-key-inventory.toml backup-2026-09-05.tgz.pqbk
+```
 
 ## Restore
 

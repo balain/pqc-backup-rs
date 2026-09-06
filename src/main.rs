@@ -3,14 +3,15 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
 };
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use hkdf::Hkdf;
 use ml_kem::{
     MlKem1024,
     kem::{Decapsulate, Encapsulate, Kem, KeyExport, TryKeyInit},
     ml_kem_1024::{DecapsulationKey, EncapsulationKey},
 };
-use sha2::{Digest, Sha384};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256, Sha384};
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
@@ -38,6 +39,10 @@ const ROOT_SECRET_LEN: usize = 32;
 const DEK_LEN: usize = 32;
 const ROOT_KEY_ID_LEN: usize = 16;
 const MAX_FILENAME_LEN: usize = 4096;
+const INVENTORY_FORMAT: &str = "PQINVENTORY01";
+const MAX_INVENTORY_LEN: u64 = 1024 * 1024;
+const MAX_INVENTORY_LABEL_LEN: usize = 200;
+const MAX_CUSTODY_LOCATION_LEN: usize = 1024;
 
 struct DecryptedArchive {
     header: Header,
@@ -72,6 +77,18 @@ impl TemporaryFile {
         self.committed = true;
         Ok(())
     }
+
+    fn replace(mut self, destination: &Path) -> Result<()> {
+        fs::rename(&self.path, destination).with_context(|| {
+            format!(
+                "replacing {} with temporary file {}",
+                destination.display(),
+                self.path.display()
+            )
+        })?;
+        self.committed = true;
+        Ok(())
+    }
 }
 
 impl Drop for TemporaryFile {
@@ -84,6 +101,7 @@ impl Drop for TemporaryFile {
 
 #[derive(Parser)]
 #[command(name = "pqbackup")]
+#[command(version)]
 #[command(about = "EXPERIMENTAL post-quantum + offline-secret backup encryption")]
 #[command(
     long_about = "EXPERIMENTAL post-quantum + offline-secret local backup encryption.\n\nThis reference implementation has not received an independent security audit and must not be the sole protection for irreplaceable, regulated, or high-value data."
@@ -129,6 +147,12 @@ enum Command {
         root_secret: PathBuf,
         #[arg(long, default_value_t = DEFAULT_CHUNK)]
         chunk_size: u32,
+        /// Require this 32-hex-character root-key ID before sealing.
+        #[arg(long)]
+        expect_root_key_id: Option<String>,
+        /// Require this root-key epoch before sealing.
+        #[arg(long)]
+        expect_root_key_epoch: Option<u32>,
     },
 
     /// Decrypt a .pqbk archive.
@@ -154,12 +178,115 @@ enum Command {
     /// Display non-secret envelope metadata without decrypting.
     Inspect { input: PathBuf },
 
+    /// Validate a key/archive file and display only non-secret metadata.
+    KeyInfo {
+        input: PathBuf,
+        #[arg(long, value_enum)]
+        kind: KeyFileKind,
+    },
+
+    /// Manage a secret-free root-key custody inventory.
+    Inventory {
+        #[command(subcommand)]
+        command: InventoryCommand,
+    },
+
     /// Create a safe sample archive and walk through the complete workflow.
     Demo {
         /// New directory for the self-contained demonstration.
         #[arg(long, default_value = "pqbackup-demo")]
         out_dir: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum KeyFileKind {
+    Root,
+    KemPublic,
+    KemSeed,
+    Archive,
+}
+
+#[derive(Subcommand)]
+enum InventoryCommand {
+    /// Create a new empty inventory file.
+    Init { inventory: PathBuf },
+
+    /// Add one root-key epoch and one or more custody locations.
+    Add {
+        inventory: PathBuf,
+        #[arg(long)]
+        root_secret: PathBuf,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long, required = true)]
+        custody: Vec<String>,
+        #[arg(long, value_enum, default_value_t = RootKeyStatus::Active)]
+        status: RootKeyStatus,
+    },
+
+    /// List inventory metadata without reading recovery secrets.
+    List { inventory: PathBuf },
+
+    /// Validate inventory structure and duplicate constraints.
+    Check { inventory: PathBuf },
+
+    /// Change lifecycle status without deleting historical metadata.
+    SetStatus {
+        inventory: PathBuf,
+        #[arg(long)]
+        root_key_id: String,
+        #[arg(long)]
+        root_key_epoch: u32,
+        #[arg(long, value_enum)]
+        status: RootKeyStatus,
+    },
+
+    /// Locate custody records matching an archive's requested root ID and epoch.
+    Locate {
+        inventory: PathBuf,
+        archive: PathBuf,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum RootKeyStatus {
+    Active,
+    Retired,
+    Compromised,
+    Destroyed,
+}
+
+impl std::fmt::Display for RootKeyStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Active => "active",
+            Self::Retired => "retired",
+            Self::Compromised => "compromised",
+            Self::Destroyed => "destroyed",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RootKeyInventory {
+    format: String,
+    #[serde(default)]
+    root_keys: Vec<RootKeyRecord>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RootKeyRecord {
+    id: String,
+    epoch: u32,
+    status: RootKeyStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    custody: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -182,6 +309,12 @@ struct RootKey {
     id: [u8; ROOT_KEY_ID_LEN],
     epoch: u32,
     secret: Zeroizing<[u8; ROOT_SECRET_LEN]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RootKeyMetadata {
+    id: [u8; ROOT_KEY_ID_LEN],
+    epoch: u32,
 }
 
 struct EncryptedFrame {
@@ -207,12 +340,16 @@ fn main() -> Result<()> {
             public_key,
             root_secret,
             chunk_size,
+            expect_root_key_id,
+            expect_root_key_epoch,
         } => seal(
             &input,
             output.as_deref(),
             &public_key,
             &root_secret,
             chunk_size,
+            expect_root_key_id.as_deref(),
+            expect_root_key_epoch,
         ),
         Command::Open {
             input,
@@ -226,6 +363,8 @@ fn main() -> Result<()> {
             root_secret,
         } => verify_archive(&input, &secret_key, &root_secret),
         Command::Inspect { input } => inspect(&input),
+        Command::KeyInfo { input, kind } => key_info(&input, kind),
+        Command::Inventory { command } => inventory_command(command),
         Command::Demo { out_dir } => demo(&out_dir),
     }
 }
@@ -252,6 +391,7 @@ fn demo(out_dir: &Path) -> Result<()> {
     let public_key = keys_dir.join("demo.mlkem1024.pub");
     let secret_key = keys_dir.join("demo.mlkem1024.seed");
     let root_key = keys_dir.join("demo.root.key");
+    let inventory = out_dir.join("root-key-inventory.toml");
 
     println!("Demo directory: {}", out_dir.display());
     println!("\n1. Create a harmless sample backup file.");
@@ -266,19 +406,33 @@ fn demo(out_dir: &Path) -> Result<()> {
     println!("\n3. Generate an independent root key (epoch 1).");
     keygen_root(&root_key, None, 1)?;
 
-    println!("\n4. Seal the sample backup.");
+    println!("\n4. Record secret-free custody metadata.");
+    inventory_init(&inventory)?;
+    inventory_add(
+        &inventory,
+        &root_key,
+        Some("disposable demo root"),
+        &["demo-only co-located keys directory".to_owned()],
+        RootKeyStatus::Active,
+    )?;
+
+    println!("\n5. Seal the sample backup.");
     seal(
         &input,
         Some(&archive),
         &public_key,
         &root_key,
         DEFAULT_CHUNK,
+        None,
+        None,
     )?;
-    println!("\n5. Inspect public archive metadata; the filename stays encrypted.");
+    println!("\n6. Inspect public archive metadata; the filename stays encrypted.");
     inspect(&archive)?;
-    println!("\n6. Verify every encrypted chunk without restoring plaintext.");
+    println!("\n7. Locate the requested root-key custody record.");
+    inventory_locate(&inventory, &archive)?;
+    println!("\n8. Verify every encrypted chunk without restoring plaintext.");
     verify_archive(&archive, &secret_key, &root_key)?;
-    println!("\n7. Restore the archive to a separate directory.");
+    println!("\n9. Restore the archive to a separate directory.");
     open_archive(&archive, Some(&restored), &secret_key, &root_key)?;
 
     if fs::read(&input)? != fs::read(&restored)? {
@@ -332,6 +486,315 @@ fn keygen_root(output: &Path, root_key_id: Option<&str>, root_key_epoch: u32) ->
     Ok(())
 }
 
+fn key_info(input: &Path, kind: KeyFileKind) -> Result<()> {
+    match kind {
+        KeyFileKind::Root => {
+            let provider = file_root_secret_provider(input)?;
+            let metadata = provider.metadata();
+            println!("file type       : PQROOT02 root key");
+            println!("validation      : valid");
+            println!("root key ID     : {}", root_key_id_hex(&metadata.id));
+            println!("root key epoch  : {}", metadata.epoch);
+            println!("secret bytes    : not displayed");
+        }
+        KeyFileKind::KemPublic => {
+            let bytes = read_exact_sized(input, MLKEM1024_PK_LEN, "ML-KEM public key")?;
+            EncapsulationKey::new_from_slice(&bytes)
+                .map_err(|_| anyhow!("invalid ML-KEM-1024 public key"))?;
+            println!("file type       : ML-KEM-1024 public key");
+            println!("validation      : valid");
+            println!("public SHA-256  : {}", sha256_hex(&bytes));
+        }
+        KeyFileKind::KemSeed => {
+            let bytes = read_exact_sized_secret(input, MLKEM_SEED_LEN, "ML-KEM secret seed")?;
+            let seed = Zeroizing::new(
+                <[u8; MLKEM_SEED_LEN]>::try_from(bytes.as_slice())
+                    .map_err(|_| anyhow!("invalid ML-KEM seed length"))?,
+            );
+            let dk = DecapsulationKey::new_from_slice(seed.as_ref())
+                .map_err(|_| anyhow!("invalid ML-KEM secret seed"))?;
+            let public = dk.encapsulation_key().to_bytes();
+            println!("file type       : ML-KEM-1024 decapsulation seed");
+            println!("validation      : valid");
+            println!("public SHA-256  : {}", sha256_hex(public.as_slice()));
+            println!("secret bytes    : not displayed");
+        }
+        KeyFileKind::Archive => {
+            let header = read_header_from_file(input)?;
+            println!("file type       : PQBACK02 archive");
+            println!("validation      : structurally valid header (unauthenticated)");
+            println!("root key ID     : {}", root_key_id_hex(&header.root_key_id));
+            println!("root key epoch  : {}", header.root_key_epoch);
+            println!("filename        : encrypted");
+        }
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn inventory_command(command: InventoryCommand) -> Result<()> {
+    match command {
+        InventoryCommand::Init { inventory } => inventory_init(&inventory),
+        InventoryCommand::Add {
+            inventory,
+            root_secret,
+            label,
+            custody,
+            status,
+        } => inventory_add(&inventory, &root_secret, label.as_deref(), &custody, status),
+        InventoryCommand::List { inventory } => inventory_list(&inventory),
+        InventoryCommand::Check { inventory } => inventory_check(&inventory),
+        InventoryCommand::SetStatus {
+            inventory,
+            root_key_id,
+            root_key_epoch,
+            status,
+        } => inventory_set_status(&inventory, &root_key_id, root_key_epoch, status),
+        InventoryCommand::Locate { inventory, archive } => inventory_locate(&inventory, &archive),
+    }
+}
+
+fn inventory_init(path: &Path) -> Result<()> {
+    let inventory = RootKeyInventory {
+        format: INVENTORY_FORMAT.to_owned(),
+        root_keys: Vec::new(),
+    };
+    let encoded = encode_inventory(&inventory)?;
+    write_new_file(path, encoded.as_bytes(), true)
+        .with_context(|| format!("creating inventory {}", path.display()))?;
+    println!("Created root-key inventory: {}", path.display());
+    println!("The inventory contains custody metadata only; never put secret bytes in it.");
+    Ok(())
+}
+
+fn inventory_add(
+    inventory_path: &Path,
+    root_secret_path: &Path,
+    label: Option<&str>,
+    custody: &[String],
+    status: RootKeyStatus,
+) -> Result<()> {
+    let mut inventory = read_inventory(inventory_path)?;
+    let provider = file_root_secret_provider(root_secret_path)?;
+    let metadata = provider.metadata();
+    let id = root_key_id_hex(&metadata.id);
+
+    validate_inventory_text(label, custody)?;
+    if inventory
+        .root_keys
+        .iter()
+        .any(|record| record.id == id && record.epoch == metadata.epoch)
+    {
+        bail!(
+            "inventory already contains root key {id} epoch {}",
+            metadata.epoch
+        );
+    }
+
+    inventory.root_keys.push(RootKeyRecord {
+        id: id.clone(),
+        epoch: metadata.epoch,
+        status,
+        label: label.map(str::to_owned),
+        custody: custody.to_vec(),
+    });
+    inventory
+        .root_keys
+        .sort_by(|a, b| (&a.id, a.epoch).cmp(&(&b.id, b.epoch)));
+    validate_inventory(&inventory)?;
+    replace_inventory(inventory_path, &encode_inventory(&inventory)?)?;
+
+    println!("Added root key {id} epoch {} to inventory.", metadata.epoch);
+    println!(
+        "Recorded {} custody location(s); no secret bytes were stored.",
+        custody.len()
+    );
+    Ok(())
+}
+
+fn inventory_list(path: &Path) -> Result<()> {
+    let inventory = read_inventory(path)?;
+    println!("Inventory: {}", path.display());
+    println!("Entries  : {}", inventory.root_keys.len());
+    for record in &inventory.root_keys {
+        println!("\n{} epoch {} [{}]", record.id, record.epoch, record.status);
+        if let Some(label) = &record.label {
+            println!("  label   : {label}");
+        }
+        for location in &record.custody {
+            println!("  custody : {location}");
+        }
+    }
+    Ok(())
+}
+
+fn inventory_check(path: &Path) -> Result<()> {
+    let inventory = read_inventory(path)?;
+    println!(
+        "Valid {INVENTORY_FORMAT} inventory: {} record(s)",
+        inventory.root_keys.len()
+    );
+    Ok(())
+}
+
+fn inventory_set_status(
+    path: &Path,
+    root_key_id: &str,
+    root_key_epoch: u32,
+    status: RootKeyStatus,
+) -> Result<()> {
+    let canonical_id = root_key_id_hex(&parse_root_key_id(root_key_id)?);
+    let mut inventory = read_inventory(path)?;
+    let record = inventory
+        .root_keys
+        .iter_mut()
+        .find(|record| record.id == canonical_id && record.epoch == root_key_epoch)
+        .ok_or_else(|| {
+            anyhow!("inventory has no record for root key {canonical_id} epoch {root_key_epoch}")
+        })?;
+    record.status = status;
+    replace_inventory(path, &encode_inventory(&inventory)?)?;
+    println!("Updated root key {canonical_id} epoch {root_key_epoch} to {status}.");
+    Ok(())
+}
+
+fn inventory_locate(inventory_path: &Path, archive_path: &Path) -> Result<()> {
+    let inventory = read_inventory(inventory_path)?;
+    let header = read_header_from_file(archive_path)?;
+    let id = root_key_id_hex(&header.root_key_id);
+    let record = inventory
+        .root_keys
+        .iter()
+        .find(|record| record.id == id && record.epoch == header.root_key_epoch)
+        .ok_or_else(|| {
+            anyhow!(
+                "inventory has no record for root key {id} epoch {}",
+                header.root_key_epoch
+            )
+        })?;
+
+    println!("Archive requests : {id} epoch {}", header.root_key_epoch);
+    println!("Inventory status : {}", record.status);
+    if let Some(label) = &record.label {
+        println!("Label            : {label}");
+    }
+    for location in &record.custody {
+        println!("Custody location : {location}");
+    }
+    if record.status != RootKeyStatus::Active {
+        eprintln!(
+            "warning: this root-key record is marked {}; follow the key lifecycle procedure",
+            record.status
+        );
+    }
+    Ok(())
+}
+
+fn encode_inventory(inventory: &RootKeyInventory) -> Result<String> {
+    toml::to_string_pretty(inventory).context("encoding root-key inventory")
+}
+
+fn read_inventory(path: &Path) -> Result<RootKeyInventory> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("reading inventory metadata from {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("inventory must be a regular file");
+    }
+    if metadata.len() > MAX_INVENTORY_LEN {
+        bail!("inventory exceeds the {MAX_INVENTORY_LEN}-byte safety limit");
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading inventory {}", path.display()))?;
+    decode_inventory(&text)
+}
+
+fn decode_inventory(text: &str) -> Result<RootKeyInventory> {
+    if text.len() as u64 > MAX_INVENTORY_LEN {
+        bail!("inventory exceeds the {MAX_INVENTORY_LEN}-byte safety limit");
+    }
+    let inventory: RootKeyInventory = toml::from_str(text).context("invalid root-key inventory")?;
+    validate_inventory(&inventory)?;
+    Ok(inventory)
+}
+
+fn validate_inventory(inventory: &RootKeyInventory) -> Result<()> {
+    if inventory.format != INVENTORY_FORMAT {
+        bail!("unsupported inventory format {}", inventory.format);
+    }
+    let mut identities = std::collections::HashSet::new();
+    for record in &inventory.root_keys {
+        let parsed = parse_root_key_id(&record.id)?;
+        if root_key_id_hex(&parsed) != record.id {
+            bail!("inventory root-key IDs must use canonical lowercase hexadecimal");
+        }
+        if !identities.insert((parsed, record.epoch)) {
+            bail!(
+                "duplicate inventory record for root key {} epoch {}",
+                record.id,
+                record.epoch
+            );
+        }
+        validate_inventory_text(record.label.as_deref(), &record.custody)?;
+    }
+    Ok(())
+}
+
+fn validate_inventory_text(label: Option<&str>, custody: &[String]) -> Result<()> {
+    if let Some(label) = label {
+        validate_single_line(label, MAX_INVENTORY_LABEL_LEN, "inventory label")?;
+    }
+    if custody.is_empty() {
+        bail!("at least one custody location is required");
+    }
+    let mut unique = std::collections::HashSet::new();
+    for location in custody {
+        validate_single_line(location, MAX_CUSTODY_LOCATION_LEN, "custody location")?;
+        if !unique.insert(location) {
+            bail!("duplicate custody location in inventory record");
+        }
+    }
+    Ok(())
+}
+
+fn validate_single_line(value: &str, max_len: usize, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > max_len
+        || value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{061c}'
+                )
+        })
+    {
+        bail!("{label} must be a non-empty single line of at most {max_len} bytes");
+    }
+    Ok(())
+}
+
+fn replace_inventory(path: &Path, encoded: &str) -> Result<()> {
+    if encoded.len() as u64 > MAX_INVENTORY_LEN {
+        bail!("inventory exceeds the {MAX_INVENTORY_LEN}-byte safety limit");
+    }
+    let pending = TemporaryFile::new(temporary_output_path(path)?);
+    let mut file = create_private_new(&pending.path)
+        .with_context(|| format!("creating temporary inventory {}", pending.path.display()))?;
+    file.write_all(encoded.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    pending.replace(path)
+}
+
 fn random_array<const N: usize>() -> Result<[u8; N]> {
     let mut out = [0u8; N];
     getrandom::fill(&mut out).context("generating random bytes")?;
@@ -344,6 +807,8 @@ fn seal(
     public_key_path: &Path,
     root_secret_path: &Path,
     chunk_size: u32,
+    expected_root_key_id: Option<&str>,
+    expected_root_key_epoch: Option<u32>,
 ) -> Result<()> {
     if chunk_size == 0 || chunk_size > MAX_CHUNK {
         bail!("chunk size must be between 1 and {MAX_CHUNK} bytes");
@@ -369,7 +834,13 @@ fn seal(
         .unwrap_or_else(|| PathBuf::from(format!("{}.pqbk", input.display())));
 
     let public_bytes = read_exact_sized(public_key_path, MLKEM1024_PK_LEN, "ML-KEM public key")?;
-    let root_key = read_root_key(root_secret_path)?;
+    let root_provider = file_root_secret_provider(root_secret_path)?;
+    let root_metadata = root_provider.metadata();
+    ensure_expected_root(
+        &root_metadata,
+        expected_root_key_id,
+        expected_root_key_epoch,
+    )?;
 
     let ek = EncapsulationKey::new_from_slice(&public_bytes)
         .map_err(|_| anyhow!("invalid ML-KEM-1024 public key"))?;
@@ -387,17 +858,13 @@ fn seal(
     getrandom::fill(&mut metadata_nonce).context("generating metadata nonce")?;
     getrandom::fill(dek.as_mut()).context("generating data encryption key")?;
 
-    let kek = Zeroizing::new(derive_kek(
-        shared_secret.as_slice(),
-        &root_key.secret,
-        &hkdf_salt,
-    )?);
+    let kek = root_provider.derive_archive_kek(shared_secret.as_slice(), &hkdf_salt)?;
 
     let metadata_aad = encode_metadata_aad(
         chunk_size,
         original_len,
-        &root_key.id,
-        root_key.epoch,
+        &root_metadata.id,
+        root_metadata.epoch,
         &hkdf_salt,
         &data_nonce_prefix,
         &wrap_nonce,
@@ -419,8 +886,8 @@ fn seal(
     let wrap_aad = encode_wrap_aad(
         chunk_size,
         original_len,
-        &root_key.id,
-        root_key.epoch,
+        &root_metadata.id,
+        root_metadata.epoch,
         &hkdf_salt,
         &data_nonce_prefix,
         &wrap_nonce,
@@ -444,8 +911,8 @@ fn seal(
     let header = Header {
         chunk_size,
         original_len,
-        root_key_id: root_key.id,
-        root_key_epoch: root_key.epoch,
+        root_key_id: root_metadata.id,
+        root_key_epoch: root_metadata.epoch,
         hkdf_salt,
         data_nonce_prefix,
         wrap_nonce,
@@ -614,7 +1081,8 @@ fn decrypt_archive_to<W: Write>(
         <[u8; MLKEM_SEED_LEN]>::try_from(seed_vec.as_slice())
             .map_err(|_| anyhow!("invalid ML-KEM seed length"))?,
     );
-    let root_key = read_root_key(root_secret_path)?;
+    let root_provider = file_root_secret_provider(root_secret_path)?;
+    let root_metadata = root_provider.metadata();
 
     let dk = DecapsulationKey::new_from_slice(seed.as_ref())
         .map_err(|_| anyhow!("invalid ML-KEM secret seed"))?;
@@ -631,17 +1099,13 @@ fn decrypt_archive_to<W: Write>(
     reader.read_exact(&mut header_bytes)?;
     let header = decode_header(&header_bytes)?;
     let header_hash = Sha384::digest(&header_bytes);
-    ensure_root_metadata(&header, &root_key)?;
+    ensure_root_metadata(&header, &root_metadata)?;
 
     let shared_secret = dk
         .decapsulate_slice(&header.kem_ciphertext)
         .map_err(|_| anyhow!("invalid ML-KEM ciphertext"))?;
 
-    let kek = Zeroizing::new(derive_kek(
-        shared_secret.as_slice(),
-        &root_key.secret,
-        &header.hkdf_salt,
-    )?);
+    let kek = root_provider.derive_archive_kek(shared_secret.as_slice(), &header.hkdf_salt)?;
 
     let metadata_aad = encode_metadata_aad(
         header.chunk_size,
@@ -1175,16 +1639,13 @@ fn create_private_new(path: &Path) -> Result<File> {
 }
 
 fn write_new_file(path: &Path, data: &[u8], secret: bool) -> Result<()> {
-    let mut f = create_new(path)?;
+    let mut f = if secret {
+        create_private_new(path)?
+    } else {
+        create_new(path)?
+    };
     f.write_all(data)?;
     f.sync_all()?;
-
-    #[cfg(unix)]
-    if secret {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-
     Ok(())
 }
 
@@ -1227,6 +1688,57 @@ fn encode_root_key(root: &RootKey) -> Vec<u8> {
     out
 }
 
+trait RootSecretProvider {
+    fn metadata(&self) -> RootKeyMetadata;
+    fn derive_archive_kek(
+        &self,
+        shared_secret: &[u8],
+        salt: &[u8; 32],
+    ) -> Result<Zeroizing<[u8; 32]>>;
+}
+
+struct FileRootSecretProvider {
+    root: RootKey,
+}
+
+impl FileRootSecretProvider {
+    fn open(path: &Path) -> Result<Self> {
+        let data = Zeroizing::new(
+            fs::read(path)
+                .with_context(|| format!("reading root secret from {}", path.display()))?,
+        );
+        Ok(Self {
+            root: decode_root_key(&data)?,
+        })
+    }
+}
+
+impl RootSecretProvider for FileRootSecretProvider {
+    fn metadata(&self) -> RootKeyMetadata {
+        RootKeyMetadata {
+            id: self.root.id,
+            epoch: self.root.epoch,
+        }
+    }
+
+    fn derive_archive_kek(
+        &self,
+        shared_secret: &[u8],
+        salt: &[u8; 32],
+    ) -> Result<Zeroizing<[u8; 32]>> {
+        Ok(Zeroizing::new(derive_kek(
+            shared_secret,
+            &self.root.secret,
+            salt,
+        )?))
+    }
+}
+
+fn file_root_secret_provider(path: &Path) -> Result<Box<dyn RootSecretProvider>> {
+    Ok(Box::new(FileRootSecretProvider::open(path)?))
+}
+
+#[cfg(test)]
 fn read_root_key(path: &Path) -> Result<RootKey> {
     let data = Zeroizing::new(
         fs::read(path).with_context(|| format!("reading root secret from {}", path.display()))?,
@@ -1308,9 +1820,35 @@ fn validate_archive_geometry(original_len: u64, chunk_size: u32) -> Result<u64> 
     Ok(chunk_count)
 }
 
-fn ensure_root_metadata(header: &Header, root_key: &RootKey) -> Result<()> {
+fn ensure_root_metadata(header: &Header, root_key: &RootKeyMetadata) -> Result<()> {
     if header.root_key_id != root_key.id || header.root_key_epoch != root_key.epoch {
         bail!("root key ID or epoch does not match this archive");
+    }
+    Ok(())
+}
+
+fn ensure_expected_root(
+    root_key: &RootKeyMetadata,
+    expected_id: Option<&str>,
+    expected_epoch: Option<u32>,
+) -> Result<()> {
+    if let Some(expected_id) = expected_id {
+        let expected_id = parse_root_key_id(expected_id)?;
+        if root_key.id != expected_id {
+            bail!(
+                "selected root key ID {} does not match expected ID {}",
+                root_key_id_hex(&root_key.id),
+                root_key_id_hex(&expected_id)
+            );
+        }
+    }
+    if let Some(expected_epoch) = expected_epoch
+        && root_key.epoch != expected_epoch
+    {
+        bail!(
+            "selected root key epoch {} does not match expected epoch {expected_epoch}",
+            root_key.epoch
+        );
     }
     Ok(())
 }
@@ -1624,6 +2162,29 @@ mod tests {
     }
 
     #[test]
+    fn file_provider_preserves_metadata_and_v2_kek_derivation() {
+        let id = test_bytes::<ROOT_KEY_ID_LEN>(0x10);
+        let secret = test_bytes::<ROOT_SECRET_LEN>(0x30);
+        let shared = test_bytes::<32>(0x50);
+        let salt = test_bytes::<32>(0x70);
+        let expected = derive_kek(&shared, &secret, &salt).unwrap();
+        let provider = FileRootSecretProvider {
+            root: RootKey {
+                id,
+                epoch: 12,
+                secret: Zeroizing::new(secret),
+            },
+        };
+        let metadata = provider.metadata();
+        assert_eq!(metadata.id, id);
+        assert_eq!(metadata.epoch, 12);
+        assert_eq!(
+            *provider.derive_archive_kek(&shared, &salt).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn metadata_aad_binds_root_id_and_epoch() {
         let kem = vec![0x42; MLKEM1024_CT_LEN];
         let a = encode_metadata_aad(
@@ -1750,7 +2311,15 @@ mod tests {
             let archive = dir.0.join(format!("{name}.pqbk"));
             let restored = dir.0.join(format!("restored-{name}"));
             write_new_file(&input, &contents, false)?;
-            seal(&input, Some(&archive), &public, &root, chunk_size)?;
+            seal(
+                &input,
+                Some(&archive),
+                &public,
+                &root,
+                chunk_size,
+                None,
+                None,
+            )?;
             verify_archive(&archive, &secret, &root)?;
             open_archive(&archive, Some(&restored), &secret, &root)?;
             assert_eq!(fs::read(&restored)?, contents);
@@ -1771,7 +2340,7 @@ mod tests {
         let input = dir.0.join("input.bin");
         let archive = dir.0.join("input.pqbk");
         write_new_file(&input, &(0u8..64).collect::<Vec<_>>(), false)?;
-        seal(&input, Some(&archive), &public, &root, 13)?;
+        seal(&input, Some(&archive), &public, &root, 13, None, None)?;
 
         let original = fs::read(&archive)?;
         let header_len = u32::from_be_bytes(original[..4].try_into().unwrap()) as usize;
@@ -1820,7 +2389,7 @@ mod tests {
         let archive = dir.0.join("input.pqbk");
         let output = dir.0.join("output.txt");
         write_new_file(&input, b"authenticated contents", false)?;
-        seal(&input, Some(&archive), &public, &root, 8)?;
+        seal(&input, Some(&archive), &public, &root, 8, None, None)?;
 
         write_new_file(&output, b"do not replace", false)?;
         assert!(open_archive(&archive, Some(&output), &secret, &root).is_err());
@@ -1856,6 +2425,227 @@ mod tests {
         assert_eq!(fs::read(&destination)?, b"existing");
         assert!(!temp_path.exists());
         Ok(())
+    }
+
+    #[test]
+    fn expected_root_assertions_prevent_wrong_epoch_sealing() -> Result<()> {
+        let dir = TestDir::new()?;
+        let (public, _, root_path) = write_test_keys(&dir.0)?;
+        let root = FileRootSecretProvider::open(&root_path)?.metadata();
+        let id = root_key_id_hex(&root.id);
+        assert!(ensure_expected_root(&root, Some(&id), Some(root.epoch)).is_ok());
+        assert!(
+            ensure_expected_root(
+                &root,
+                Some("ffffffffffffffffffffffffffffffff"),
+                Some(root.epoch)
+            )
+            .is_err()
+        );
+        assert!(ensure_expected_root(&root, Some(&id), Some(root.epoch + 1)).is_err());
+
+        let input = dir.0.join("input.txt");
+        let rejected = dir.0.join("rejected.pqbk");
+        write_new_file(&input, b"root assertion", false)?;
+        assert!(
+            seal(
+                &input,
+                Some(&rejected),
+                &public,
+                &root_path,
+                64,
+                Some(&id),
+                Some(root.epoch + 1),
+            )
+            .is_err()
+        );
+        assert!(!rejected.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn key_info_validates_all_supported_material_types() -> Result<()> {
+        let dir = TestDir::new()?;
+        let (public, secret, root) = write_test_keys(&dir.0)?;
+        let input = dir.0.join("input.txt");
+        let archive = dir.0.join("input.pqbk");
+        write_new_file(&input, b"key info", false)?;
+        seal(&input, Some(&archive), &public, &root, 64, None, None)?;
+
+        key_info(&root, KeyFileKind::Root)?;
+        key_info(&public, KeyFileKind::KemPublic)?;
+        key_info(&secret, KeyFileKind::KemSeed)?;
+        key_info(&archive, KeyFileKind::Archive)?;
+        assert!(key_info(&root, KeyFileKind::KemSeed).is_err());
+
+        let public_bytes = fs::read(&public)?;
+        let seed_bytes = Zeroizing::new(fs::read(&secret)?);
+        let dk = DecapsulationKey::new_from_slice(seed_bytes.as_slice()).unwrap();
+        assert_eq!(
+            sha256_hex(&public_bytes),
+            sha256_hex(dk.encapsulation_key().to_bytes().as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_records_no_secrets_and_locates_archive_epoch() -> Result<()> {
+        let dir = TestDir::new()?;
+        let (public, secret, root_path) = write_test_keys(&dir.0)?;
+        let inventory_path = dir.0.join("inventory.toml");
+        inventory_init(&inventory_path)?;
+        inventory_add(
+            &inventory_path,
+            &root_path,
+            Some("annual archive root"),
+            &[
+                "offline safe copy A".to_owned(),
+                "offsite safe copy B".to_owned(),
+            ],
+            RootKeyStatus::Active,
+        )?;
+        inventory_check(&inventory_path)?;
+        inventory_list(&inventory_path)?;
+
+        let inventory_text = fs::read_to_string(&inventory_path)?;
+        assert!(inventory_text.contains(INVENTORY_FORMAT));
+        assert!(!inventory_text.contains("secret"));
+        let inventory = read_inventory(&inventory_path)?;
+        assert_eq!(inventory.root_keys.len(), 1);
+        assert_eq!(inventory.root_keys[0].custody.len(), 2);
+
+        let input = dir.0.join("input.txt");
+        let archive = dir.0.join("input.pqbk");
+        write_new_file(&input, b"inventory locate", false)?;
+        seal(&input, Some(&archive), &public, &root_path, 64, None, None)?;
+        inventory_locate(&inventory_path, &archive)?;
+
+        let root = read_root_key(&root_path)?;
+        inventory_set_status(
+            &inventory_path,
+            &root_key_id_hex(&root.id),
+            root.epoch,
+            RootKeyStatus::Retired,
+        )?;
+        assert_eq!(
+            read_inventory(&inventory_path)?.root_keys[0].status,
+            RootKeyStatus::Retired
+        );
+        assert!(
+            inventory_add(
+                &inventory_path,
+                &root_path,
+                None,
+                &["duplicate".to_owned()],
+                RootKeyStatus::Active,
+            )
+            .is_err()
+        );
+
+        let seed_copy = dir.0.join("seed-copy");
+        let root_copy = dir.0.join("root-copy");
+        fs::copy(&secret, &seed_copy)?;
+        fs::copy(&root_path, &root_copy)?;
+        verify_archive(&archive, &secret, &root_path)?;
+        verify_archive(&archive, &seed_copy, &root_copy)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&inventory_path)?.permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(fs::metadata(&secret)?.permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&root_path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_inventory_is_rejected() -> Result<()> {
+        let dir = TestDir::new()?;
+        let path = dir.0.join("inventory.toml");
+        fs::write(
+            &path,
+            r#"format = "PQINVENTORY01"
+
+[[root_keys]]
+id = "00112233445566778899AABBCCDDEEFF"
+epoch = 1
+status = "active"
+custody = ["safe"]
+"#,
+        )?;
+        assert!(read_inventory(&path).is_err());
+
+        fs::write(
+            &path,
+            r#"format = "PQINVENTORY01"
+unexpected = "field"
+"#,
+        )?;
+        assert!(read_inventory(&path).is_err());
+
+        let oversized = "x".repeat(MAX_INVENTORY_LEN as usize + 1);
+        assert!(decode_inventory(&oversized).is_err());
+        assert!(validate_single_line("safe\u{202e}txt", 200, "label").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn phase3_cli_accepts_repeated_custody_and_root_assertions() {
+        let cli = Cli::try_parse_from([
+            "pqbackup",
+            "inventory",
+            "add",
+            "inventory.toml",
+            "--root-secret",
+            "root.key",
+            "--custody",
+            "copy A",
+            "--custody",
+            "copy B",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Inventory {
+                command: InventoryCommand::Add { custody, .. },
+            } => assert_eq!(custody, ["copy A", "copy B"]),
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "pqbackup",
+            "seal",
+            "input",
+            "--public-key",
+            "public",
+            "--root-secret",
+            "root",
+            "--expect-root-key-id",
+            "00112233445566778899aabbccddeeff",
+            "--expect-root-key-epoch",
+            "2027",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Seal {
+                expect_root_key_id,
+                expect_root_key_epoch,
+                ..
+            } => {
+                assert_eq!(
+                    expect_root_key_id.as_deref(),
+                    Some("00112233445566778899aabbccddeeff")
+                );
+                assert_eq!(expect_root_key_epoch, Some(2027));
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 
     struct FailingWriter;

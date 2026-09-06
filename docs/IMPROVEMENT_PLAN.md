@@ -4,7 +4,7 @@
 **Basis:** [Long-term security assessment](./LONG_TERM_SECURITY_ASSESSMENT.md)  
 **Current format:** `PQBACK02` archives and `PQROOT02` root keys
 
-**Phase status:** Phases 0, 1, and 2 completed on 2026-09-06. Later phases remain planned.
+**Phase status:** Phases 0, 1, and 2 completed on 2026-09-06. Phase 3 engineering completed on 2026-09-06; its operator recovery-drill gate remains pending. Later phases remain planned.
 
 ## Objective
 
@@ -167,6 +167,17 @@ completed without crashes on 2026-09-06.
 **Estimated effort:** L.
 
 ## Phase 3 — Improve key lifecycle and custody
+
+**Status: Engineering completed; operational validation pending (2026-09-06).**
+The CLI now provides typed key validation, ML-KEM public fingerprints, a
+secret-free `PQINVENTORY01` custody inventory, lifecycle status changes,
+archive-to-custody lookup, and optional root ID/epoch assertions during seal.
+Secret files receive restrictive permissions at creation, and archive
+cryptography uses a provider boundary capable of future non-exportable
+backends. [`KEY_MANAGEMENT.md`](./KEY_MANAGEMENT.md) defines provisioning,
+rotation, retirement, compromise, destruction, migration, and recovery drills.
+Completion still requires operators to exercise two genuinely independent
+custody copies in their deployment environment.
 
 **Goal:** reduce the chance that key handling defeats the two-secret design.
 

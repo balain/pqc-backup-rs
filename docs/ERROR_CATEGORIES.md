@@ -22,4 +22,4 @@ Exact CLI messages are diagnostics and are not a stable API. Implementations and
 
 Authentication-related failures SHOULD remain coarse in remote or multi-user contexts. The current CLI is local and may distinguish the filename, DEK-wrap, and chunk stage for diagnosis, but callers must not treat those distinctions as proof of key validity.
 
-A failed operation MUST NOT rename a partial plaintext file into the requested destination. Cleanup failure may leave a hidden temporary file in the destination directory; operators should protect that directory as plaintext-bearing storage.
+A failed operation MUST NOT publish a partial plaintext file at the requested destination. Cleanup failure may leave a hidden temporary file in the destination directory; operators should protect that directory as plaintext-bearing storage.

@@ -22,7 +22,7 @@ Describe the symmetric margin conservatively: a 256-bit root secret and AES-256 
 
 ### Content integrity and recovery safety
 
-Each archive uses fresh KEM encapsulation, salt, DEK, nonce prefix, and wrap nonce. Chunk AAD binds the complete header hash, index, plaintext length, and final flag. The decoder rejects sequence errors, excess lengths, unauthenticated truncation, and trailing data. Restore writes to a temporary file and renames it only after successful complete authentication.
+Each archive uses fresh KEM encapsulation, salt, DEK, nonce prefix, and wrap nonce. Chunk AAD binds the complete header hash, index, plaintext length, and final flag. The decoder rejects sequence errors, excess lengths, unauthenticated truncation, and trailing data. Restore writes to a temporary file and publishes it without replacement only after successful complete authentication.
 
 AES-GCM requires unique nonces for each key; NIST calls this crucial in [SP 800-38D](https://csrc.nist.gov/pubs/sp/800/38/d/final). A fresh DEK plus a 64-bit random prefix and 32-bit chunk index provide distinct nonce values within a non-overflowing archive.
 

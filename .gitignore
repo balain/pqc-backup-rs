@@ -6,4 +6,4 @@
 *.pqbk
 *.mlkem1024.seed
 *.root.key
-
+root-key-inventory*.toml

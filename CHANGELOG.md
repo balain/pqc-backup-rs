@@ -4,9 +4,22 @@ All notable security-relevant and user-visible changes are recorded here.
 
 ## Unreleased
 
+## 0.0.3 - 2026-09-06
+
 ### Release automation
 
 - Changed `v*` tag builds from temporary Actions artifacts to GitHub Releases with a packaged Linux x86-64 binary and SHA-256 checksum.
+
+### Phase 3 key lifecycle and custody
+
+- Added `key-info` validation for root keys, ML-KEM public keys, ML-KEM seeds, and archive routing headers without displaying secret bytes.
+- Added matching SHA-256 public-key fingerprints for ML-KEM public/seed pairing.
+- Added the bounded, secret-free `PQINVENTORY01` custody inventory with init, add, list, check, locate, and lifecycle status commands.
+- Added optional root-key ID and epoch assertions to `seal` for safer automation.
+- Added a root-secret provider boundary suitable for future non-exportable backends while retaining the file provider.
+- Changed secret and inventory creation to apply Unix mode `0600` at file creation time.
+- Added key lifecycle, rotation, compromise, destruction, provider, and independent recovery-drill guidance.
+- Expanded the demo and test suite for inventory, key validation, redundant recovery copies, permissions, and root expectation failures.
 
 ## 0.0.2 - 2026-09-06
 

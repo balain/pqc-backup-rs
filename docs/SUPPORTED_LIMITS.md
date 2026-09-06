@@ -11,9 +11,9 @@ The security-supported development scope is:
 - an operating system CSPRNG available through `getrandom`;
 - a current Rust toolchain capable of building the locked dependencies.
 
-Windows, network filesystems, cloud-synchronized folders, FUSE filesystems, object-store mounts, unusual removable-media filesystems, containers with weak entropy, and 32-bit targets are not security-supported yet. They may work, but file permissions, atomic rename, durability, and failure behavior have not been validated.
+Windows, network filesystems, cloud-synchronized folders, FUSE filesystems, object-store mounts, unusual removable-media filesystems, containers with weak entropy, and 32-bit targets are not security-supported yet. They may work, but file permissions, atomic publication, durability, and failure behavior have not been validated.
 
-The current Unix implementation sets newly written secret files to mode `0600`. It does not validate directory permissions or defend against a compromised parent directory.
+The current Unix implementation creates new secret and inventory files with mode `0600` atomically. It does not validate directory permissions or defend against a compromised parent directory.
 
 ## Current enforced format limits
 
@@ -32,6 +32,7 @@ The current Unix implementation sets newly written secret files to mode `0600`. 
 | ML-KEM public key | Exactly 1568 bytes |
 | ML-KEM seed | Exactly 64 bytes |
 | Root secret | Exactly 32 bytes inside `PQROOT02` |
+| Root-key inventory | `PQINVENTORY01` UTF-8 TOML, at most 1 MiB |
 | Wrapped DEK | 32-byte DEK plus 16-byte GCM tag |
 | Existing output | Never overwritten |
 | Trailing archive data | Rejected after authenticated final chunk |
