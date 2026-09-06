@@ -4,6 +4,18 @@ All notable security-relevant and user-visible changes are recorded here.
 
 ## Unreleased
 
+## 0.0.5 - 2026-09-06
+
+### Phase 5 archive provenance
+
+- Added separate ML-DSA-87 signing seed/public-key generation with stable signer IDs and rotation epochs.
+- Added a rigorously specified `PQSIG001` trailer that signs every byte of the frozen `PQBACK02` encrypted envelope plus canonical signer metadata.
+- Added a bounded `PQSIGNERS01` trust policy that binds IDs, epochs, identities, lifecycle states, and public-key fingerprints.
+- Added separate `sign` and `provenance-verify` commands so signing authority does not need recovery keys or plaintext.
+- Rejects unsigned, modified, substituted, nested, truncated, retired-by-default, revoked, wrong-key, and policy-mismatch verification cases.
+- Expanded demo mode, key inspection, documentation, tests, and fuzz targets for provenance.
+- Documented that signatures provide creator authentication but not trusted time, deletion detection, replay prevention, or newest-backup selection.
+
 ## 0.0.4 - 2026-09-06
 
 ### Phase 4 durable releases and recovery

@@ -160,7 +160,12 @@ frame_ciphertext = AES-256-GCM(DEK).encrypt(
 
 An empty file has exactly one frame with index 0, plaintext length 0, final flag 1, and a 16-byte GCM tag.
 
-A non-empty file has one or more frames. Exactly one authenticated final frame MUST occur. It MUST be last. The sum of authenticated plaintext lengths MUST equal `original_length`. Any byte after the final frame is invalid.
+A non-empty file has one or more frames. Exactly one authenticated final frame
+MUST occur. It MUST be last. The sum of authenticated plaintext lengths MUST
+equal `original_length`. The base unsigned envelope ends after the final frame.
+Starting with `pqbackup` 0.0.5, a decoder MAY accept exactly one rigorously
+specified [`PQSIG001` provenance extension](./PQBACK02_PROVENANCE_FORMAT.md)
+after that boundary. Any other byte after the final frame is invalid.
 
 ## Decoder rejection requirements
 
@@ -175,7 +180,8 @@ A decoder MUST reject:
 - KEM, filename, DEK-wrap, or chunk authentication failure;
 - non-sequential indexes;
 - plaintext length greater than chunk size;
-- missing final frame, total-length mismatch, or trailing bytes;
+- missing final frame, total-length mismatch, or trailing bytes other than one
+  complete canonical `PQSIG001` extension;
 - unsafe decrypted filename.
 
 Authentication failures SHOULD be exposed through coarse error categories. Exact diagnostic text is not part of the format.

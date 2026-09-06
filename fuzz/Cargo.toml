@@ -15,6 +15,7 @@ getrandom = "0.4.3"
 hkdf = "0.13.0"
 libfuzzer-sys = "0.4"
 ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
+ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "getrandom", "zeroize"] }
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.11.0"
 toml = "0.9"
@@ -44,6 +45,20 @@ bench = false
 [[bin]]
 name = "decode-inventory"
 path = "fuzz_targets/decode_inventory.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode-provenance"
+path = "fuzz_targets/decode_provenance.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode-signer-policy"
+path = "fuzz_targets/decode_signer_policy.rs"
 test = false
 doc = false
 bench = false

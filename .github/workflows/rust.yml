@@ -71,6 +71,10 @@ jobs:
         run: cargo +nightly-2026-07-14 fuzz run frame-traversal -- -runs=1000
       - name: Fuzz inventory decoder
         run: cargo +nightly-2026-07-14 fuzz run decode-inventory -- -runs=1000
+      - name: Fuzz provenance decoder
+        run: cargo +nightly-2026-07-14 fuzz run decode-provenance -- -runs=1000 -max_len=5000
+      - name: Fuzz signer-policy decoder
+        run: cargo +nightly-2026-07-14 fuzz run decode-signer-policy -- -runs=1000
 
   release-build:
     if: startsWith(github.ref, 'refs/tags/v')

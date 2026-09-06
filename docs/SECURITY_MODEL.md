@@ -1,7 +1,7 @@
 # Security model
 
 **Status:** Experimental baseline  
-**Applies to:** `PQBACK02` archives and `PQROOT02` root keys  
+**Applies to:** `PQBACK02` archives, optional `PQSIG001` provenance, and key/policy files
 **Related:** [Supported limits](./SUPPORTED_LIMITS.md), [Risk register](./RISK_REGISTER.md), and [long-term assessment](./LONG_TERM_SECURITY_ASSESSMENT.md)
 
 ## Security objective
@@ -34,16 +34,19 @@ The archive's approximate size, exact declared plaintext length, algorithms, chu
 - The operator selecting the intended input, output, and key paths.
 - Separate custody locations for the ML-KEM seed and root key.
 - The `pqbackup` binary and source/release materials used for recovery.
+- The signer public key and `PQSIGNERS01` policy when provenance is evaluated.
 
 ### Untrusted
 
 - Every `.pqbk` archive before full cryptographic verification.
 - Archive filenames, directories, removable media, network storage, and transport.
-- Header values displayed by `inspect`.
+- Header and signer values displayed by `inspect`.
 - Any recovered filename until encrypted metadata authenticates.
 - Demo-generated key layouts.
 
-`inspect` parses public routing metadata without recovery keys. Its output is not authenticated and must not be treated as authoritative proof of the key, epoch, creator, or archive history.
+`inspect` parses public routing and self-asserted signer metadata without
+recovery or verification keys. Its output is not authenticated and must not be
+treated as authoritative proof of a key, epoch, creator, or archive history.
 
 ## Adversaries considered
 
@@ -62,7 +65,8 @@ The archive's approximate size, exact declared plaintext length, algorithms, chu
 - Traffic analysis or inference from visible file length and operational metadata.
 - Side-channel attacks outside protections supplied by the operating system and dependencies.
 - Supply-chain compromise of source, compiler, dependencies, or distributed binaries.
-- Rollback and provenance attacks requiring proof of who created an archive.
+- Trusted creation time, newest-version selection, deletion detection, and
+  rollback prevention without an external catalog or timestamp authority.
 
 ## Security properties
 
@@ -72,7 +76,11 @@ Content uses a fresh AES-256-GCM DEK. The DEK is wrapped by a KEK derived from t
 
 ### Integrity
 
-AES-GCM authenticates encrypted filename metadata, the wrapped DEK, and every data chunk. Chunk AAD binds the header hash, chunk index, plaintext length, and final flag. Full verification rejects reordering, truncation, unexpected trailing data, and authenticated-length mismatch.
+AES-GCM authenticates encrypted filename metadata, the wrapped DEK, and every
+data chunk. Chunk AAD binds the header hash, chunk index, plaintext length, and
+final flag. Full verification rejects reordering, truncation, unsupported
+trailing data, and authenticated-length mismatch. Exactly one canonical
+provenance trailer may follow the encrypted envelope.
 
 ### Availability
 
@@ -80,7 +88,17 @@ The format detects corruption but cannot prevent deletion or replacement. Availa
 
 ### Provenance
 
-Creator identity, non-repudiation, trusted timestamps, and rollback prevention are explicitly deferred. They require a signing-key trust and revocation model before a signed format is designed.
+The optional `PQSIG001` extension uses ML-DSA-87 to cover the complete encrypted
+envelope and canonical signer metadata. `provenance-verify` attributes those
+exact bytes to an identity only after a separately authenticated public key and
+`PQSIGNERS01` policy bind the signer ID, epoch, fingerprint, identity, and
+lifecycle state. Retired keys require explicit historical acceptance; revoked
+keys are rejected.
+
+This is creator authentication, not non-repudiation, trusted time, freshness,
+or rollback prevention. Valid copies and older valid archives remain valid.
+Those properties require an authenticated append-only catalog or trusted
+timestamp that version 0.0.5 does not provide.
 
 ## Operational policy decisions
 
@@ -96,8 +114,7 @@ Creator identity, non-repudiation, trusted timestamps, and rollback prevention a
 - Sole backup or sole protection for irreplaceable data.
 - Regulated or high-assurance use without separate review and applicable validation.
 - Multi-user or remote decryption services exposed to hostile callers.
-- Proof of archive creator or creation time.
+- Proof of creation time, freshness, uniqueness, or newest-backup status.
 - Unattended production sealing that keeps both recovery secret classes online.
 - Archives beyond the current enforced limits or the provisional Phase 2 targets.
 - “Write once and forget” retention without periodic verification and migration.
-

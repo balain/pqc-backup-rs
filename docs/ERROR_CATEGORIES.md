@@ -13,7 +13,8 @@ Exact CLI messages are diagnostics and are not a stable API. Implementations and
 | Authentication failed | Filename, wrapped DEK, or chunk did not authenticate | Temporary output removed |
 | Chunk sequence failed | Index, finality, count, or total length is inconsistent | Temporary output removed |
 | Archive truncated | Required header/frame bytes or final frame are missing | Temporary output removed |
-| Trailing data | Bytes follow the authenticated final frame | Temporary output removed |
+| Trailing data | Bytes after the final frame are not exactly one supported canonical provenance trailer | Temporary output removed |
+| Provenance invalid | Signature bytes, coverage boundary, public key, fingerprint, or signer policy do not validate | No trust decision; encrypted content is not opened by provenance verification |
 | Unsafe filename | Decrypted filename is not an allowed single component | No completed output |
 | Output conflict | Destination already exists or cannot be created safely | Existing destination unchanged |
 | Local I/O failure | Read, write, sync, permission, hard-link publication, or cleanup failed | Existing destination is never overwritten; temporary cleanup attempted |

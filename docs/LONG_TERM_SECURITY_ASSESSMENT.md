@@ -1,6 +1,6 @@
 # Long-term security assessment
 
-**Assessment date:** 2026-09-05; updated through Phase 4 on 2026-09-06
+**Assessment date:** 2026-09-05; updated through Phase 5 engineering on 2026-09-06
 **Assessed revision:** `PQBACK02` / `PQROOT02`  
 **Scope:** local archival confidentiality and recoverability. This is a source review, not an independent audit, certification, or security guarantee.
 
@@ -8,7 +8,7 @@
 
 `pqbackup` has a sound *experimental* long-term confidentiality design for a single-user, offline-backup threat model. Every archive requires two independent secret classes: an ML-KEM-1024 decapsulation seed and a separately held 256-bit root secret. An attacker who harvests encrypted archives today does not obtain the root secret, so a future break of ML-KEM alone should not reveal the archive DEK.
 
-This is suitable for evaluation and defense-in-depth copies whose plaintext and recovery materials already have careful custody. It is **not appropriate as the sole protection for irreplaceable, regulated, or high-value data**. The limiting factors are the unaudited ML-KEM implementation, custom-format maturity, raw local key handling, absent independent review, and the operational challenge of preserving keys and a working decoder for decades.
+This is suitable for evaluation and defense-in-depth copies whose plaintext and recovery materials already have careful custody. Optional ML-DSA-87 provenance can now identify who signed exact encrypted bytes under an independently distributed policy. It is **not appropriate as the sole protection for irreplaceable, regulated, or high-value data**. The limiting factors are unaudited cryptographic dependencies, custom-format maturity, raw local key handling, absent independent review, and the operational challenge of preserving keys, policies, and a working decoder for decades.
 
 ## Security capabilities
 
@@ -36,7 +36,7 @@ They are not secret entropy and do not prove the identity of whoever sealed an a
 
 ### Unaudited cryptographic implementation
 
-The lockfile selects `ml-kem` 0.3.2. Its own [documentation](https://docs.rs/crate/ml-kem/0.3.2) says the implementation has never been independently audited. FIPS 203 standardization does not validate this particular Rust implementation. The root secret reduces the impact of a KEM confidentiality failure but does not eliminate implementation bugs, side channels, malformed-input behavior, or denial-of-service concerns.
+The lockfile selects `ml-kem` 0.3.2 and `ml-dsa` 0.1.1. RustCrypto states that these implementations have not been independently audited. FIPS 203/204 standardization does not validate these particular Rust implementations. The selected `ml-dsa` version is newer than the versions affected by the published [signature-verification advisory](https://github.com/RustCrypto/signatures/security/advisories/GHSA-5x2r-hc65-25f9), but future advisories and implementation defects remain possible. The root secret reduces the impact of a KEM confidentiality failure but does not eliminate implementation bugs, side channels, malformed-input behavior, or denial-of-service concerns.
 
 ### Endpoint compromise and secret handling
 
@@ -54,9 +54,11 @@ The ML-KEM seed and `PQROOT02` root-key file are sufficient recovery material. T
 
 Header ID/epoch values are visible and not authenticated until recovery reaches the AEAD checks. Treat `inspect` results from an untrusted archive as routing information, not authoritative key provenance.
 
-### No sender authentication, provenance, or rollback protection
+### Creator authentication is optional; time and rollback remain external
 
-AES-GCM authenticates an archive to someone holding the recovery capability; it does not prove who created it. There is no digital signature, trusted timestamp, append-only log, or replay/rollback control. An attacker who can substitute, delete, or replay archives can still cause availability and provenance failures.
+AES-GCM authenticates an archive to someone holding the recovery capability; it does not prove who created it. Version 0.0.5 can append an ML-DSA-87 signature over the complete encrypted envelope and signer ID/epoch statement. Verification binds that signature to a human or service identity only through a separately authenticated public key and `PQSIGNERS01` policy. Trusted, retired, and revoked states make key lifecycle decisions explicit.
+
+There is still no trusted timestamp, append-only catalog, deletion detection, or newest-backup selection. A byte-for-byte copy or older valid archive remains cryptographically valid. Operators requiring replay or rollback evidence must maintain an authenticated external catalog with monotonic application state.
 
 ### Metadata and denial-of-service exposure
 
@@ -98,7 +100,8 @@ verified copies and continue scheduled restore and migration drills.
 | Generic PQ symmetric margin | Approximately 128-bit class | Standard generic quantum-search assumptions. |
 | Content tamper detection | Strong | Complete decoder checks succeed. |
 | Filename privacy | Good | File length and routing metadata remain visible. |
-| Archive sender identity | Absent | No archive signature or trusted archive-creator identity exists. |
+| Archive signer identity | Available but experimental | ML-DSA-87 signature, independently authenticated public key/policy, and acceptable lifecycle state. |
+| Creation time / newest archive | Absent | Requires an external trusted timestamp or authenticated append-only catalog. |
 | Release provenance | Good for tagged artifacts | GitHub/Sigstore attestation and trusted roots are preserved and verified. |
 | Endpoint-compromise resistance | Weak | Secrets/plaintext enter the local process. |
 | Compliance readiness | Insufficient | No validation or independent audit evidence. |
@@ -111,7 +114,7 @@ verified copies and continue scheduled restore and migration drills.
 3. Complete two-person offline restore drills from independently held recovery-kit and key copies.
 4. Establish approved source-tag signing and verify release attestations before distribution.
 5. Implement and review an approved hardware/non-exportable root-key backend if the deployment requires it.
-6. Add a canonical signed envelope only if creator identity and archive provenance are required, along with signing-key distribution and rotation policy.
+6. Independently review the canonical signed representation, ML-DSA usage, signer-policy distribution, and revocation behavior before relying on provenance for high-value decisions.
 7. Execute the scheduled migration procedure: periodically decrypt, verify, and reseal archives with reviewed software while retaining old keys and decoders.
 
 ## Bottom line

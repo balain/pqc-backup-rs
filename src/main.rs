@@ -5,6 +5,11 @@ use aes_gcm::{
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use hkdf::Hkdf;
+use ml_dsa::{
+    EncodedVerifyingKey, Keypair, MlDsa87, Seed as MlDsaSeed, Signature as MlDsaSignature,
+    SigningKey as MlDsaSigningKey, VerifyingKey as MlDsaVerifyingKey,
+    signature::{DigestSigner, DigestVerifier, digest::Update},
+};
 use ml_kem::{
     MlKem1024,
     kem::{Decapsulate, Encapsulate, Kem, KeyExport, TryKeyInit},
@@ -43,10 +48,26 @@ const INVENTORY_FORMAT: &str = "PQINVENTORY01";
 const MAX_INVENTORY_LEN: u64 = 1024 * 1024;
 const MAX_INVENTORY_LABEL_LEN: usize = 200;
 const MAX_CUSTODY_LOCATION_LEN: usize = 1024;
+const SIGNING_SECRET_MAGIC: &[u8; 8] = b"PQSIGN01";
+const SIGNING_PUBLIC_MAGIC: &[u8; 8] = b"PQPUBS01";
+const SIGNING_KEY_VERSION: u16 = 1;
+const SIGNATURE_ALG_MLDSA87: u16 = 1;
+const SIGNER_KEY_ID_LEN: usize = 16;
+const MLDSA_SEED_LEN: usize = 32;
+const MLDSA87_PUBLIC_KEY_LEN: usize = 2592;
+const MLDSA87_SIGNATURE_LEN: usize = 4627;
+const PROVENANCE_MAGIC: &[u8; 8] = b"PQSIG001";
+const PROVENANCE_VERSION: u16 = 1;
+const PROVENANCE_STATEMENT_LEN: usize = 8 + 2 + 2 + SIGNER_KEY_ID_LEN + 4 + 8 + 4;
+const PROVENANCE_DOMAIN: &[u8] = b"pqbackup/provenance/v1\0";
+const SIGNER_POLICY_FORMAT: &str = "PQSIGNERS01";
+const MAX_SIGNER_POLICY_LEN: u64 = 1024 * 1024;
+const MAX_SIGNER_IDENTITY_LEN: usize = 300;
 
 struct DecryptedArchive {
     header: Header,
     original_name: String,
+    provenance: Option<ProvenanceTrailer>,
 }
 
 struct TemporaryFile {
@@ -136,6 +157,20 @@ enum Command {
         root_key_epoch: u32,
     },
 
+    /// Create an ML-DSA-87 archive-signing seed and public verification key.
+    KeygenSigning {
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long, default_value = "archive-signer")]
+        name: String,
+        /// Stable 32-hex-character signer-key ID. Generated randomly when omitted.
+        #[arg(long)]
+        signer_key_id: Option<String>,
+        /// Non-negative signer-key rotation epoch.
+        #[arg(long, default_value_t = 0)]
+        signer_key_epoch: u32,
+    },
+
     /// Encrypt a .tgz (or any file) into a .pqbk archive.
     Seal {
         input: PathBuf,
@@ -178,6 +213,27 @@ enum Command {
     /// Display non-secret envelope metadata without decrypting.
     Inspect { input: PathBuf },
 
+    /// Add an ML-DSA-87 provenance signature to an unsigned PQBACK02 archive.
+    Sign {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        signing_key: PathBuf,
+    },
+
+    /// Verify archive provenance against a public key and explicit trust policy.
+    ProvenanceVerify {
+        input: PathBuf,
+        #[arg(long)]
+        public_key: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        /// Permit a valid historical signature from a policy entry marked retired.
+        #[arg(long)]
+        allow_retired: bool,
+    },
+
     /// Validate a key/archive file and display only non-secret metadata.
     KeyInfo {
         input: PathBuf,
@@ -189,6 +245,12 @@ enum Command {
     Inventory {
         #[command(subcommand)]
         command: InventoryCommand,
+    },
+
+    /// Manage a secret-free signer trust policy.
+    SignerPolicy {
+        #[command(subcommand)]
+        command: SignerPolicyCommand,
     },
 
     /// Create a safe sample archive and walk through the complete workflow.
@@ -205,6 +267,42 @@ enum KeyFileKind {
     KemPublic,
     KemSeed,
     Archive,
+    SigningPublic,
+    SigningSeed,
+}
+
+#[derive(Subcommand)]
+enum SignerPolicyCommand {
+    /// Create a new empty signer policy.
+    Init { policy: PathBuf },
+
+    /// Bind one public key and epoch to a trusted identity.
+    Add {
+        policy: PathBuf,
+        #[arg(long)]
+        public_key: PathBuf,
+        #[arg(long)]
+        identity: String,
+        #[arg(long, value_enum, default_value_t = SignerStatus::Trusted)]
+        status: SignerStatus,
+    },
+
+    /// List signer identities, fingerprints, epochs, and lifecycle states.
+    List { policy: PathBuf },
+
+    /// Validate policy structure and duplicate constraints.
+    Check { policy: PathBuf },
+
+    /// Change a signer lifecycle state without deleting history.
+    SetStatus {
+        policy: PathBuf,
+        #[arg(long)]
+        signer_key_id: String,
+        #[arg(long)]
+        signer_key_epoch: u32,
+        #[arg(long, value_enum)]
+        status: SignerStatus,
+    },
 }
 
 #[derive(Subcommand)]
@@ -289,6 +387,42 @@ struct RootKeyRecord {
     custody: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum SignerStatus {
+    Trusted,
+    Retired,
+    Revoked,
+}
+
+impl std::fmt::Display for SignerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Trusted => "trusted",
+            Self::Retired => "retired",
+            Self::Revoked => "revoked",
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SignerPolicy {
+    format: String,
+    #[serde(default)]
+    signers: Vec<SignerRecord>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SignerRecord {
+    id: String,
+    epoch: u32,
+    identity: String,
+    status: SignerStatus,
+    public_sha256: String,
+}
+
 #[derive(Debug)]
 struct Header {
     chunk_size: u32,
@@ -317,6 +451,32 @@ struct RootKeyMetadata {
     epoch: u32,
 }
 
+struct SigningSecret {
+    id: [u8; SIGNER_KEY_ID_LEN],
+    epoch: u32,
+    seed: Zeroizing<[u8; MLDSA_SEED_LEN]>,
+}
+
+struct SigningPublic {
+    id: [u8; SIGNER_KEY_ID_LEN],
+    epoch: u32,
+    encoded: [u8; MLDSA87_PUBLIC_KEY_LEN],
+}
+
+struct ProvenanceTrailer {
+    signer_key_id: [u8; SIGNER_KEY_ID_LEN],
+    signer_key_epoch: u32,
+    signed_len: u64,
+    statement: [u8; PROVENANCE_STATEMENT_LEN],
+    signature: Vec<u8>,
+}
+
+struct ArchiveLayout {
+    header: Header,
+    envelope_len: u64,
+    provenance: Option<ProvenanceTrailer>,
+}
+
 struct EncryptedFrame {
     index: u32,
     plain_len: usize,
@@ -334,6 +494,12 @@ fn main() -> Result<()> {
             root_key_id,
             root_key_epoch,
         } => keygen_root(&output, root_key_id.as_deref(), root_key_epoch),
+        Command::KeygenSigning {
+            out_dir,
+            name,
+            signer_key_id,
+            signer_key_epoch,
+        } => keygen_signing(&out_dir, &name, signer_key_id.as_deref(), signer_key_epoch),
         Command::Seal {
             input,
             output,
@@ -363,8 +529,20 @@ fn main() -> Result<()> {
             root_secret,
         } => verify_archive(&input, &secret_key, &root_secret),
         Command::Inspect { input } => inspect(&input),
+        Command::Sign {
+            input,
+            output,
+            signing_key,
+        } => sign_archive(&input, output.as_deref(), &signing_key),
+        Command::ProvenanceVerify {
+            input,
+            public_key,
+            policy,
+            allow_retired,
+        } => verify_provenance(&input, &public_key, &policy, allow_retired),
         Command::KeyInfo { input, kind } => key_info(&input, kind),
         Command::Inventory { command } => inventory_command(command),
+        Command::SignerPolicy { command } => signer_policy_command(command),
         Command::Demo { out_dir } => demo(&out_dir),
     }
 }
@@ -386,12 +564,16 @@ fn demo(out_dir: &Path) -> Result<()> {
     fs::create_dir(&restore_dir)?;
 
     let input = out_dir.join("demo-backup.txt");
+    let unsigned_archive = out_dir.join("demo-backup.unsigned.pqbk");
     let archive = out_dir.join("demo-backup.pqbk");
     let restored = restore_dir.join("demo-backup.txt");
     let public_key = keys_dir.join("demo.mlkem1024.pub");
     let secret_key = keys_dir.join("demo.mlkem1024.seed");
     let root_key = keys_dir.join("demo.root.key");
     let inventory = out_dir.join("root-key-inventory.toml");
+    let signing_seed = keys_dir.join("demo-signer.mldsa87.seed");
+    let signing_public = keys_dir.join("demo-signer.mldsa87.pub");
+    let signer_policy = out_dir.join("signer-policy.toml");
 
     println!("Demo directory: {}", out_dir.display());
     println!("\n1. Create a harmless sample backup file.");
@@ -416,23 +598,45 @@ fn demo(out_dir: &Path) -> Result<()> {
         RootKeyStatus::Active,
     )?;
 
-    println!("\n5. Seal the sample backup.");
+    println!("\n5. Generate an ML-DSA-87 archive-signing identity.");
+    keygen_signing(&keys_dir, "demo-signer", None, 1)?;
+
+    println!("\n6. Create an explicit signer trust policy.");
+    signer_policy_init(&signer_policy)?;
+    signer_policy_add(
+        &signer_policy,
+        &signing_public,
+        "Disposable pqbackup demo signer",
+        SignerStatus::Trusted,
+    )?;
+
+    println!("\n7. Seal the sample backup.");
     seal(
         &input,
-        Some(&archive),
+        Some(&unsigned_archive),
         &public_key,
         &root_key,
         DEFAULT_CHUNK,
         None,
         None,
     )?;
-    println!("\n6. Inspect public archive metadata; the filename stays encrypted.");
+
+    println!("\n8. Sign the complete encrypted envelope.");
+    sign_archive(&unsigned_archive, Some(&archive), &signing_seed)?;
+
+    println!("\n9. Inspect public metadata; the filename and signer identity stay undisclosed.");
     inspect(&archive)?;
-    println!("\n7. Locate the requested root-key custody record.");
+
+    println!("\n10. Verify provenance against the explicit trust policy.");
+    verify_provenance(&archive, &signing_public, &signer_policy, false)?;
+
+    println!("\n11. Locate the requested root-key custody record.");
     inventory_locate(&inventory, &archive)?;
-    println!("\n8. Verify every encrypted chunk without restoring plaintext.");
+
+    println!("\n12. Verify every encrypted chunk without restoring plaintext.");
     verify_archive(&archive, &secret_key, &root_key)?;
-    println!("\n9. Restore the archive to a separate directory.");
+
+    println!("\n13. Restore the archive to a separate directory.");
     open_archive(&archive, Some(&restored), &secret_key, &root_key)?;
 
     if fs::read(&input)? != fs::read(&restored)? {
@@ -486,6 +690,50 @@ fn keygen_root(output: &Path, root_key_id: Option<&str>, root_key_epoch: u32) ->
     Ok(())
 }
 
+fn keygen_signing(
+    out_dir: &Path,
+    name: &str,
+    signer_key_id: Option<&str>,
+    signer_key_epoch: u32,
+) -> Result<()> {
+    validate_single_line(name, MAX_FILENAME_LEN, "signing-key name")?;
+    if Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name) {
+        bail!("signing-key name must be a safe single path component");
+    }
+    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    let id = match signer_key_id {
+        Some(value) => parse_signer_key_id(value)?,
+        None => random_array::<SIGNER_KEY_ID_LEN>()?,
+    };
+    let secret = SigningSecret {
+        id,
+        epoch: signer_key_epoch,
+        seed: Zeroizing::new(random_array::<MLDSA_SEED_LEN>()?),
+    };
+    let signing_key = signing_key_from_secret(&secret);
+    let verifying_key = signing_key.verifying_key().encode();
+    let public = SigningPublic {
+        id,
+        epoch: signer_key_epoch,
+        encoded: verifying_key.as_slice().try_into().unwrap(),
+    };
+
+    let public_path = out_dir.join(format!("{name}.mldsa87.pub"));
+    let secret_path = out_dir.join(format!("{name}.mldsa87.seed"));
+    write_new_file(&public_path, &encode_signing_public(&public), false)?;
+    write_new_file(&secret_path, &encode_signing_secret(&secret), true)?;
+
+    println!("Created ML-DSA-87 provenance material:");
+    println!("  public key : {}", public_path.display());
+    println!("  secret seed: {}", secret_path.display());
+    println!("  signer ID  : {}", signer_key_id_hex(&id));
+    println!("  signer epoch: {signer_key_epoch}");
+    println!(
+        "Keep the signing seed offline and distribute the public key through a trusted channel."
+    );
+    Ok(())
+}
+
 fn key_info(input: &Path, kind: KeyFileKind) -> Result<()> {
     match kind {
         KeyFileKind::Root => {
@@ -520,12 +768,32 @@ fn key_info(input: &Path, kind: KeyFileKind) -> Result<()> {
             println!("secret bytes    : not displayed");
         }
         KeyFileKind::Archive => {
-            let header = read_header_from_file(input)?;
+            let layout = scan_archive_layout(input)?;
+            let header = layout.header;
             println!("file type       : PQBACK02 archive");
-            println!("validation      : structurally valid header (unauthenticated)");
+            println!("validation      : structurally valid envelope (unauthenticated)");
             println!("root key ID     : {}", root_key_id_hex(&header.root_key_id));
             println!("root key epoch  : {}", header.root_key_epoch);
             println!("filename        : encrypted");
+            print_provenance_metadata(layout.provenance.as_ref());
+        }
+        KeyFileKind::SigningPublic => {
+            let public = read_signing_public(input)?;
+            println!("file type       : PQPUBS01 ML-DSA-87 public key");
+            println!("validation      : valid");
+            println!("signer key ID   : {}", signer_key_id_hex(&public.id));
+            println!("signer epoch    : {}", public.epoch);
+            println!("public SHA-256  : {}", sha256_hex(&public.encoded));
+        }
+        KeyFileKind::SigningSeed => {
+            let secret = read_signing_secret(input)?;
+            let public = signing_key_from_secret(&secret).verifying_key().encode();
+            println!("file type       : PQSIGN01 ML-DSA-87 signing seed");
+            println!("validation      : valid");
+            println!("signer key ID   : {}", signer_key_id_hex(&secret.id));
+            println!("signer epoch    : {}", secret.epoch);
+            println!("public SHA-256  : {}", sha256_hex(public.as_slice()));
+            println!("secret bytes    : not displayed");
         }
     }
     Ok(())
@@ -795,6 +1063,203 @@ fn replace_inventory(path: &Path, encoded: &str) -> Result<()> {
     pending.replace(path)
 }
 
+fn signer_policy_command(command: SignerPolicyCommand) -> Result<()> {
+    match command {
+        SignerPolicyCommand::Init { policy } => signer_policy_init(&policy),
+        SignerPolicyCommand::Add {
+            policy,
+            public_key,
+            identity,
+            status,
+        } => signer_policy_add(&policy, &public_key, &identity, status),
+        SignerPolicyCommand::List { policy } => signer_policy_list(&policy),
+        SignerPolicyCommand::Check { policy } => signer_policy_check(&policy),
+        SignerPolicyCommand::SetStatus {
+            policy,
+            signer_key_id,
+            signer_key_epoch,
+            status,
+        } => signer_policy_set_status(&policy, &signer_key_id, signer_key_epoch, status),
+    }
+}
+
+fn signer_policy_init(path: &Path) -> Result<()> {
+    let policy = SignerPolicy {
+        format: SIGNER_POLICY_FORMAT.to_owned(),
+        signers: Vec::new(),
+    };
+    write_new_file(path, encode_signer_policy(&policy)?.as_bytes(), true)
+        .with_context(|| format!("creating signer policy {}", path.display()))?;
+    println!("Created signer trust policy: {}", path.display());
+    println!("Protect this policy's integrity and distribute it through a trusted channel.");
+    Ok(())
+}
+
+fn signer_policy_add(
+    policy_path: &Path,
+    public_key_path: &Path,
+    identity: &str,
+    status: SignerStatus,
+) -> Result<()> {
+    validate_single_line(identity, MAX_SIGNER_IDENTITY_LEN, "signer identity")?;
+    let public = read_signing_public(public_key_path)?;
+    let id = signer_key_id_hex(&public.id);
+    let mut policy = read_signer_policy(policy_path)?;
+    if policy
+        .signers
+        .iter()
+        .any(|record| record.id == id && record.epoch == public.epoch)
+    {
+        bail!("policy already contains signer {id} epoch {}", public.epoch);
+    }
+    policy.signers.push(SignerRecord {
+        id: id.clone(),
+        epoch: public.epoch,
+        identity: identity.to_owned(),
+        status,
+        public_sha256: sha256_hex(&public.encoded),
+    });
+    policy
+        .signers
+        .sort_by(|a, b| (&a.id, a.epoch).cmp(&(&b.id, b.epoch)));
+    validate_signer_policy(&policy)?;
+    replace_signer_policy(policy_path, &encode_signer_policy(&policy)?)?;
+    println!("Added signer {id} epoch {} [{status}].", public.epoch);
+    println!("Identity: {identity}");
+    Ok(())
+}
+
+fn signer_policy_list(path: &Path) -> Result<()> {
+    let policy = read_signer_policy(path)?;
+    println!("Signer policy: {}", path.display());
+    println!("Entries      : {}", policy.signers.len());
+    for record in &policy.signers {
+        println!("\n{} epoch {} [{}]", record.id, record.epoch, record.status);
+        println!("  identity      : {}", record.identity);
+        println!("  public SHA-256: {}", record.public_sha256);
+    }
+    Ok(())
+}
+
+fn signer_policy_check(path: &Path) -> Result<()> {
+    let policy = read_signer_policy(path)?;
+    println!(
+        "Valid {SIGNER_POLICY_FORMAT} signer policy: {} record(s)",
+        policy.signers.len()
+    );
+    Ok(())
+}
+
+fn signer_policy_set_status(
+    path: &Path,
+    signer_key_id: &str,
+    signer_key_epoch: u32,
+    status: SignerStatus,
+) -> Result<()> {
+    let canonical_id = signer_key_id_hex(&parse_signer_key_id(signer_key_id)?);
+    let mut policy = read_signer_policy(path)?;
+    let record = policy
+        .signers
+        .iter_mut()
+        .find(|record| record.id == canonical_id && record.epoch == signer_key_epoch)
+        .ok_or_else(|| {
+            anyhow!("policy has no record for signer {canonical_id} epoch {signer_key_epoch}")
+        })?;
+    record.status = status;
+    replace_signer_policy(path, &encode_signer_policy(&policy)?)?;
+    println!("Updated signer {canonical_id} epoch {signer_key_epoch} to {status}.");
+    Ok(())
+}
+
+fn encode_signer_policy(policy: &SignerPolicy) -> Result<String> {
+    toml::to_string_pretty(policy).context("encoding signer trust policy")
+}
+
+fn read_signer_policy(path: &Path) -> Result<SignerPolicy> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("reading signer policy metadata from {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("signer policy must be a regular file");
+    }
+    if metadata.len() > MAX_SIGNER_POLICY_LEN {
+        bail!("signer policy exceeds the {MAX_SIGNER_POLICY_LEN}-byte safety limit");
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading signer policy {}", path.display()))?;
+    decode_signer_policy(&text)
+}
+
+fn decode_signer_policy(text: &str) -> Result<SignerPolicy> {
+    if text.len() as u64 > MAX_SIGNER_POLICY_LEN {
+        bail!("signer policy exceeds the {MAX_SIGNER_POLICY_LEN}-byte safety limit");
+    }
+    let policy: SignerPolicy = toml::from_str(text).context("invalid signer trust policy")?;
+    validate_signer_policy(&policy)?;
+    Ok(policy)
+}
+
+fn validate_signer_policy(policy: &SignerPolicy) -> Result<()> {
+    if policy.format != SIGNER_POLICY_FORMAT {
+        bail!("unsupported signer policy format {}", policy.format);
+    }
+    let mut identities = std::collections::HashSet::new();
+    for record in &policy.signers {
+        let parsed_id = parse_signer_key_id(&record.id)?;
+        if signer_key_id_hex(&parsed_id) != record.id {
+            bail!("signer IDs must use canonical lowercase hexadecimal");
+        }
+        if !identities.insert((parsed_id, record.epoch)) {
+            bail!(
+                "duplicate signer policy record for {} epoch {}",
+                record.id,
+                record.epoch
+            );
+        }
+        validate_single_line(&record.identity, MAX_SIGNER_IDENTITY_LEN, "signer identity")?;
+        parse_sha256_hex(&record.public_sha256)?;
+        if record
+            .public_sha256
+            .bytes()
+            .any(|byte| byte.is_ascii_uppercase())
+        {
+            bail!("public-key fingerprints must use canonical lowercase hexadecimal");
+        }
+    }
+    Ok(())
+}
+
+fn replace_signer_policy(path: &Path, encoded: &str) -> Result<()> {
+    if encoded.len() as u64 > MAX_SIGNER_POLICY_LEN {
+        bail!("signer policy exceeds the {MAX_SIGNER_POLICY_LEN}-byte safety limit");
+    }
+    let pending = TemporaryFile::new(temporary_output_path(path)?);
+    let mut file = create_private_new(&pending.path).with_context(|| {
+        format!(
+            "creating temporary signer policy {}",
+            pending.path.display()
+        )
+    })?;
+    file.write_all(encoded.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    pending.replace(path)
+}
+
+fn parse_sha256_hex(value: &str) -> Result<[u8; 32]> {
+    parse_fixed_hex(value, "SHA-256 fingerprint")
+}
+
+fn parse_fixed_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
+    if value.len() != N * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{label} must be exactly {} hexadecimal characters", N * 2);
+    }
+    let mut result = [0u8; N];
+    for (index, slot) in result.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    Ok(result)
+}
+
 fn random_array<const N: usize>() -> Result<[u8; N]> {
     let mut out = [0u8; N];
     getrandom::fill(&mut out).context("generating random bytes")?;
@@ -1017,6 +1482,234 @@ fn seal(
     Ok(())
 }
 
+fn sign_archive(input: &Path, output: Option<&Path>, signing_key_path: &Path) -> Result<()> {
+    let source_layout = scan_archive_layout(input)?;
+    if source_layout.provenance.is_some() {
+        bail!("archive already has a provenance signature; re-sign from the unsigned archive");
+    }
+    let out_path = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_signed_output(input));
+    if input == out_path {
+        bail!("signed output must differ from the input archive");
+    }
+    if out_path.exists() {
+        bail!(
+            "refusing to overwrite existing output {}",
+            out_path.display()
+        );
+    }
+
+    let pending = TemporaryFile::new(temporary_output_path(&out_path)?);
+    let mut source =
+        BufReader::new(File::open(input).with_context(|| format!("opening {}", input.display()))?);
+    let mut destination = BufWriter::new(
+        create_private_new(&pending.path)
+            .with_context(|| format!("creating temporary output {}", pending.path.display()))?,
+    );
+    let copied = std::io::copy(&mut source, &mut destination)?;
+    destination.flush()?;
+    destination.get_ref().sync_all()?;
+    drop(destination);
+
+    let copied_layout = scan_archive_layout(&pending.path)?;
+    if copied_layout.provenance.is_some() || copied != copied_layout.envelope_len {
+        bail!("input changed or gained a signature while it was being copied");
+    }
+    if copied_layout.envelope_len != source_layout.envelope_len {
+        bail!("input changed while it was being copied");
+    }
+
+    let secret = read_signing_secret(signing_key_path)?;
+    let signing_key = signing_key_from_secret(&secret);
+    let statement =
+        encode_provenance_statement(&secret.id, secret.epoch, copied_layout.envelope_len);
+    let signature: MlDsaSignature<MlDsa87> = signing_key
+        .try_sign_digest(|digest| {
+            feed_provenance_message(
+                digest,
+                &pending.path,
+                copied_layout.envelope_len,
+                &statement,
+            )
+        })
+        .map_err(|_| anyhow!("ML-DSA-87 signing failed"))?;
+    signing_key
+        .verifying_key()
+        .verify_digest(
+            |digest| {
+                feed_provenance_message(
+                    digest,
+                    &pending.path,
+                    copied_layout.envelope_len,
+                    &statement,
+                )
+            },
+            &signature,
+        )
+        .map_err(|_| anyhow!("internal ML-DSA-87 signature self-check failed"))?;
+    let encoded_signature = signature.encode();
+    if encoded_signature.len() != MLDSA87_SIGNATURE_LEN {
+        bail!("ML-DSA-87 produced an unexpected signature length");
+    }
+
+    let mut destination = OpenOptions::new()
+        .append(true)
+        .open(&pending.path)
+        .with_context(|| format!("appending signature to {}", pending.path.display()))?;
+    destination.write_all(&statement)?;
+    destination.write_all(encoded_signature.as_slice())?;
+    destination.sync_all()?;
+    drop(destination);
+
+    let signed_layout = scan_archive_layout(&pending.path)?;
+    let trailer = signed_layout
+        .provenance
+        .as_ref()
+        .ok_or_else(|| anyhow!("internal error: signed archive has no provenance trailer"))?;
+    if trailer.signer_key_id != secret.id || trailer.signer_key_epoch != secret.epoch {
+        bail!("internal error: signed archive metadata mismatch");
+    }
+    let archive_sha256 = sha256_file(&pending.path)?;
+    pending.commit(&out_path)?;
+
+    println!("Signed {} -> {}", input.display(), out_path.display());
+    println!("Signer ID    : {}", signer_key_id_hex(&secret.id));
+    println!("Signer epoch : {}", secret.epoch);
+    println!("Archive SHA-256: {archive_sha256}");
+    println!("Verify provenance with the public key and a separately trusted signer policy.");
+    Ok(())
+}
+
+fn verify_provenance(
+    input: &Path,
+    public_key_path: &Path,
+    policy_path: &Path,
+    allow_retired: bool,
+) -> Result<()> {
+    let layout = scan_archive_layout(input)?;
+    let trailer = layout
+        .provenance
+        .as_ref()
+        .ok_or_else(|| anyhow!("archive has no provenance signature"))?;
+    let public = read_signing_public(public_key_path)?;
+    if trailer.signer_key_id != public.id || trailer.signer_key_epoch != public.epoch {
+        bail!(
+            "public key identity does not match archive signer {} epoch {}",
+            signer_key_id_hex(&trailer.signer_key_id),
+            trailer.signer_key_epoch
+        );
+    }
+    if trailer.signed_len != layout.envelope_len {
+        bail!("provenance trailer does not cover the complete encrypted envelope");
+    }
+    let signature = MlDsaSignature::<MlDsa87>::try_from(trailer.signature.as_slice())
+        .map_err(|_| anyhow!("invalid ML-DSA-87 signature encoding"))?;
+    let verifying_key = verifying_key_from_public(&public)?;
+    verifying_key
+        .verify_digest(
+            |digest| feed_provenance_message(digest, input, trailer.signed_len, &trailer.statement),
+            &signature,
+        )
+        .map_err(|_| anyhow!("archive provenance signature is invalid"))?;
+
+    let policy = read_signer_policy(policy_path)?;
+    let id = signer_key_id_hex(&public.id);
+    let record = policy
+        .signers
+        .iter()
+        .find(|record| record.id == id && record.epoch == public.epoch)
+        .ok_or_else(|| {
+            anyhow!(
+                "signer {id} epoch {} is not present in the trust policy",
+                public.epoch
+            )
+        })?;
+    let fingerprint = sha256_hex(&public.encoded);
+    if record.public_sha256 != fingerprint {
+        bail!("public key fingerprint does not match the trusted signer policy");
+    }
+    match record.status {
+        SignerStatus::Trusted => {}
+        SignerStatus::Retired if allow_retired => {}
+        SignerStatus::Retired => bail!(
+            "signer {id} epoch {} is retired; use --allow-retired only for approved historical archives",
+            public.epoch
+        ),
+        SignerStatus::Revoked => bail!(
+            "signer {id} epoch {} is revoked and cannot be accepted",
+            public.epoch
+        ),
+    }
+
+    let archive_sha256 = sha256_file(input)?;
+    println!("Valid archive provenance: {}", input.display());
+    println!("Signer identity : {}", record.identity);
+    println!("Signer ID       : {id}");
+    println!("Signer epoch    : {}", public.epoch);
+    println!("Policy status   : {}", record.status);
+    println!("Archive SHA-256 : {archive_sha256}");
+    if record.status == SignerStatus::Retired {
+        eprintln!("warning: accepted a retired signer under explicit historical policy");
+    }
+    Ok(())
+}
+
+fn feed_provenance_message<D: Update>(
+    digest: &mut D,
+    path: &Path,
+    signed_len: u64,
+    statement: &[u8; PROVENANCE_STATEMENT_LEN],
+) -> std::result::Result<(), ml_dsa::signature::Error> {
+    digest.update(PROVENANCE_DOMAIN);
+    let file = File::open(path).map_err(|_| ml_dsa::signature::Error::new())?;
+    let mut reader = BufReader::new(file).take(signed_len);
+    let mut remaining = signed_len;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining != 0 {
+        let read_len = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        let count = reader
+            .read(&mut buffer[..read_len])
+            .map_err(|_| ml_dsa::signature::Error::new())?;
+        if count == 0 {
+            return Err(ml_dsa::signature::Error::new());
+        }
+        digest.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    digest.update(statement);
+    Ok(())
+}
+
+fn default_signed_output(input: &Path) -> PathBuf {
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    let name = input.file_name().unwrap_or_default().to_string_lossy();
+    if let Some(stem) = name.strip_suffix(".pqbk") {
+        parent.join(format!("{stem}.signed.pqbk"))
+    } else {
+        parent.join(format!("{name}.signed.pqbk"))
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut reader =
+        BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        Digest::update(&mut digest, &buffer[..count]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn open_archive(
     input: &Path,
     output: Option<&Path>,
@@ -1041,6 +1734,7 @@ fn open_archive(
     let mut writer = BufWriter::new(file);
 
     let decrypted = decrypt_archive_to(input, secret_key_path, root_secret_path, &mut writer)?;
+    let provenance_present = decrypted.provenance.is_some();
     let out_path = requested_output.unwrap_or_else(|| PathBuf::from(decrypted.original_name));
     if out_path.exists() {
         bail!(
@@ -1055,6 +1749,10 @@ fn open_archive(
     pending.commit(&out_path)?;
 
     println!("Opened {} -> {}", input.display(), out_path.display());
+    if provenance_present {
+        println!("Provenance trailer: present but not verified by this command");
+        println!("Run `pqbackup provenance-verify` with an explicit signer policy.");
+    }
     Ok(())
 }
 
@@ -1066,6 +1764,10 @@ fn verify_archive(input: &Path, secret_key_path: &Path, root_secret_path: &Path)
         input.display(),
         decrypted.header.original_len
     );
+    if decrypted.provenance.is_some() {
+        println!("Provenance trailer: present but not verified by this command");
+        println!("Run `pqbackup provenance-verify` with an explicit signer policy.");
+    }
     Ok(())
 }
 
@@ -1179,6 +1881,9 @@ fn decrypt_archive_to<W: Write>(
 
     let mut expected_index: u32 = 0;
     let mut total: u64 = 0;
+    let mut envelope_len = 4u64
+        .checked_add(header_len as u64)
+        .ok_or_else(|| anyhow!("archive length overflow"))?;
 
     loop {
         if u64::from(expected_index) >= MAX_DATA_CHUNKS {
@@ -1186,6 +1891,9 @@ fn decrypt_archive_to<W: Write>(
         }
         let frame = read_encrypted_frame(&mut reader, header.chunk_size)?
             .ok_or_else(|| anyhow!("archive truncated before authenticated final chunk"))?;
+        envelope_len = envelope_len
+            .checked_add(9 + frame.plain_len as u64 + GCM_TAG_LEN as u64)
+            .ok_or_else(|| anyhow!("archive length overflow"))?;
 
         if frame.index != expected_index {
             bail!(
@@ -1241,14 +1949,12 @@ fn decrypt_archive_to<W: Write>(
         );
     }
 
-    let mut trailing = [0u8; 1];
-    if reader.read(&mut trailing)? != 0 {
-        bail!("unexpected trailing data after final chunk");
-    }
+    let provenance = read_optional_provenance(&mut reader, envelope_len)?;
 
     Ok(DecryptedArchive {
         header,
         original_name,
+        provenance,
     })
 }
 
@@ -1283,7 +1989,8 @@ fn temporary_output_path(output: &Path) -> Result<PathBuf> {
 }
 
 fn inspect(input: &Path) -> Result<()> {
-    let header = read_header_from_file(input)?;
+    let layout = scan_archive_layout(input)?;
+    let header = &layout.header;
 
     println!("format          : PQBACK02");
     println!("version         : {VERSION}");
@@ -1297,7 +2004,172 @@ fn inspect(input: &Path) -> Result<()> {
     println!("filename        : encrypted");
     println!("KEM ciphertext  : {} bytes", header.kem_ciphertext.len());
     println!("wrapped DEK     : {} bytes", header.wrapped_dek.len());
+    println!("envelope bytes  : {}", layout.envelope_len);
+    print_provenance_metadata(layout.provenance.as_ref());
     Ok(())
+}
+
+fn scan_archive_layout(input: &Path) -> Result<ArchiveLayout> {
+    let metadata =
+        fs::metadata(input).with_context(|| format!("reading metadata for {}", input.display()))?;
+    if !metadata.is_file() {
+        bail!("archive must be a regular file");
+    }
+    let mut reader = BufReader::new(
+        File::open(input).with_context(|| format!("opening archive {}", input.display()))?,
+    );
+    let header_len = read_u32(&mut reader)? as usize;
+    if header_len > MAX_HEADER_LEN {
+        bail!("unreasonable header length");
+    }
+    let mut header_bytes = vec![0u8; header_len];
+    reader
+        .read_exact(&mut header_bytes)
+        .context("archive truncated inside header")?;
+    let header = decode_header(&header_bytes)?;
+    let mut envelope_len = 4u64
+        .checked_add(header_len as u64)
+        .ok_or_else(|| anyhow!("archive length overflow"))?;
+    let mut expected_index = 0u32;
+    let mut total = 0u64;
+
+    loop {
+        if u64::from(expected_index) >= MAX_DATA_CHUNKS {
+            bail!("archive exceeds the {MAX_DATA_CHUNKS}-chunk safety limit");
+        }
+        let frame = read_encrypted_frame(&mut reader, header.chunk_size)?
+            .ok_or_else(|| anyhow!("archive truncated before final chunk"))?;
+        if frame.index != expected_index {
+            bail!(
+                "chunk sequence error: expected {expected_index}, got {}",
+                frame.index
+            );
+        }
+        if frame.plain_len == 0 && (!frame.is_final || header.original_len != 0) {
+            bail!("empty chunks are only valid as the final frame of an empty archive");
+        }
+        total = total
+            .checked_add(frame.plain_len as u64)
+            .ok_or_else(|| anyhow!("archive plaintext length overflow"))?;
+        if total > header.original_len {
+            bail!("archive data exceeds declared original length");
+        }
+        envelope_len = envelope_len
+            .checked_add(9 + frame.plain_len as u64 + GCM_TAG_LEN as u64)
+            .ok_or_else(|| anyhow!("archive length overflow"))?;
+        expected_index = expected_index
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("too many chunks"))?;
+        if frame.is_final {
+            break;
+        }
+    }
+    if total != header.original_len {
+        bail!(
+            "archive length mismatch: expected {}, got {}",
+            header.original_len,
+            total
+        );
+    }
+    let provenance = read_optional_provenance(&mut reader, envelope_len)?;
+    Ok(ArchiveLayout {
+        header,
+        envelope_len,
+        provenance,
+    })
+}
+
+fn encode_provenance_statement(
+    signer_key_id: &[u8; SIGNER_KEY_ID_LEN],
+    signer_key_epoch: u32,
+    signed_len: u64,
+) -> [u8; PROVENANCE_STATEMENT_LEN] {
+    let mut out = [0u8; PROVENANCE_STATEMENT_LEN];
+    out[..8].copy_from_slice(PROVENANCE_MAGIC);
+    out[8..10].copy_from_slice(&PROVENANCE_VERSION.to_be_bytes());
+    out[10..12].copy_from_slice(&SIGNATURE_ALG_MLDSA87.to_be_bytes());
+    out[12..12 + SIGNER_KEY_ID_LEN].copy_from_slice(signer_key_id);
+    out[12 + SIGNER_KEY_ID_LEN..16 + SIGNER_KEY_ID_LEN]
+        .copy_from_slice(&signer_key_epoch.to_be_bytes());
+    out[16 + SIGNER_KEY_ID_LEN..24 + SIGNER_KEY_ID_LEN].copy_from_slice(&signed_len.to_be_bytes());
+    out[24 + SIGNER_KEY_ID_LEN..].copy_from_slice(&(MLDSA87_SIGNATURE_LEN as u32).to_be_bytes());
+    out
+}
+
+fn read_optional_provenance<R: Read>(
+    reader: &mut R,
+    envelope_len: u64,
+) -> Result<Option<ProvenanceTrailer>> {
+    let mut statement = [0u8; PROVENANCE_STATEMENT_LEN];
+    if reader.read(&mut statement[..1])? == 0 {
+        return Ok(None);
+    }
+    reader
+        .read_exact(&mut statement[1..])
+        .context("archive truncated inside provenance statement")?;
+    if &statement[..8] != PROVENANCE_MAGIC {
+        bail!("unexpected trailing data after final chunk");
+    }
+    if u16::from_be_bytes(statement[8..10].try_into().unwrap()) != PROVENANCE_VERSION {
+        bail!("unsupported provenance trailer version");
+    }
+    if u16::from_be_bytes(statement[10..12].try_into().unwrap()) != SIGNATURE_ALG_MLDSA87 {
+        bail!("unsupported provenance signature algorithm");
+    }
+    let signer_key_id = statement[12..12 + SIGNER_KEY_ID_LEN].try_into().unwrap();
+    let signer_key_epoch = u32::from_be_bytes(
+        statement[12 + SIGNER_KEY_ID_LEN..16 + SIGNER_KEY_ID_LEN]
+            .try_into()
+            .unwrap(),
+    );
+    let signed_len = u64::from_be_bytes(
+        statement[16 + SIGNER_KEY_ID_LEN..24 + SIGNER_KEY_ID_LEN]
+            .try_into()
+            .unwrap(),
+    );
+    if signed_len != envelope_len {
+        bail!(
+            "provenance signed length {signed_len} does not match envelope length {envelope_len}"
+        );
+    }
+    let signature_len =
+        u32::from_be_bytes(statement[24 + SIGNER_KEY_ID_LEN..].try_into().unwrap()) as usize;
+    if signature_len != MLDSA87_SIGNATURE_LEN {
+        bail!("invalid ML-DSA-87 signature length {signature_len}");
+    }
+    let mut signature = vec![0u8; signature_len];
+    reader
+        .read_exact(&mut signature)
+        .context("archive truncated inside provenance signature")?;
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        bail!("unexpected data after provenance trailer");
+    }
+    Ok(Some(ProvenanceTrailer {
+        signer_key_id,
+        signer_key_epoch,
+        signed_len,
+        statement,
+        signature,
+    }))
+}
+
+fn print_provenance_metadata(provenance: Option<&ProvenanceTrailer>) {
+    match provenance {
+        None => println!("provenance      : unsigned"),
+        Some(trailer) => {
+            println!("provenance      : signature present (unverified)");
+            println!("signature       : ML-DSA-87 / FIPS 204");
+            println!(
+                "signer key ID    : {} (unverified)",
+                signer_key_id_hex(&trailer.signer_key_id)
+            );
+            println!(
+                "signer epoch     : {} (unverified)",
+                trailer.signer_key_epoch
+            );
+        }
+    }
 }
 
 fn derive_kek(shared: &[u8], root: &[u8; ROOT_SECRET_LEN], salt: &[u8; 32]) -> Result<[u8; 32]> {
@@ -1770,6 +2642,116 @@ fn decode_root_key(data: &[u8]) -> Result<RootKey> {
     Ok(RootKey { id, epoch, secret })
 }
 
+fn encode_signing_secret(secret: &SigningSecret) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 2 + 2 + SIGNER_KEY_ID_LEN + 4 + MLDSA_SEED_LEN);
+    out.extend_from_slice(SIGNING_SECRET_MAGIC);
+    out.extend_from_slice(&SIGNING_KEY_VERSION.to_be_bytes());
+    out.extend_from_slice(&SIGNATURE_ALG_MLDSA87.to_be_bytes());
+    out.extend_from_slice(&secret.id);
+    out.extend_from_slice(&secret.epoch.to_be_bytes());
+    out.extend_from_slice(secret.seed.as_ref());
+    out
+}
+
+fn decode_signing_secret(data: &[u8]) -> Result<SigningSecret> {
+    let expected = 8 + 2 + 2 + SIGNER_KEY_ID_LEN + 4 + MLDSA_SEED_LEN;
+    if data.len() != expected {
+        bail!(
+            "signing key must be a PQSIGN01 key file ({expected} bytes); got {}",
+            data.len()
+        );
+    }
+    if &data[..8] != SIGNING_SECRET_MAGIC {
+        bail!("signing key is not a PQSIGN01 key file");
+    }
+    if u16::from_be_bytes(data[8..10].try_into().unwrap()) != SIGNING_KEY_VERSION {
+        bail!("unsupported signing-key version");
+    }
+    if u16::from_be_bytes(data[10..12].try_into().unwrap()) != SIGNATURE_ALG_MLDSA87 {
+        bail!("unsupported signing-key algorithm");
+    }
+    Ok(SigningSecret {
+        id: data[12..12 + SIGNER_KEY_ID_LEN].try_into().unwrap(),
+        epoch: u32::from_be_bytes(
+            data[12 + SIGNER_KEY_ID_LEN..16 + SIGNER_KEY_ID_LEN]
+                .try_into()
+                .unwrap(),
+        ),
+        seed: Zeroizing::new(data[16 + SIGNER_KEY_ID_LEN..].try_into().unwrap()),
+    })
+}
+
+fn read_signing_secret(path: &Path) -> Result<SigningSecret> {
+    let expected = 8 + 2 + 2 + SIGNER_KEY_ID_LEN + 4 + MLDSA_SEED_LEN;
+    let data = read_exact_sized_secret(path, expected, "ML-DSA-87 signing seed")?;
+    decode_signing_secret(data.as_ref())
+}
+
+fn encode_signing_public(public: &SigningPublic) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 2 + 2 + SIGNER_KEY_ID_LEN + 4 + MLDSA87_PUBLIC_KEY_LEN);
+    out.extend_from_slice(SIGNING_PUBLIC_MAGIC);
+    out.extend_from_slice(&SIGNING_KEY_VERSION.to_be_bytes());
+    out.extend_from_slice(&SIGNATURE_ALG_MLDSA87.to_be_bytes());
+    out.extend_from_slice(&public.id);
+    out.extend_from_slice(&public.epoch.to_be_bytes());
+    out.extend_from_slice(&public.encoded);
+    out
+}
+
+fn decode_signing_public(data: &[u8]) -> Result<SigningPublic> {
+    let expected = 8 + 2 + 2 + SIGNER_KEY_ID_LEN + 4 + MLDSA87_PUBLIC_KEY_LEN;
+    if data.len() != expected {
+        bail!(
+            "public signing key must be a PQPUBS01 key file ({expected} bytes); got {}",
+            data.len()
+        );
+    }
+    if &data[..8] != SIGNING_PUBLIC_MAGIC {
+        bail!("public signing key is not a PQPUBS01 key file");
+    }
+    if u16::from_be_bytes(data[8..10].try_into().unwrap()) != SIGNING_KEY_VERSION {
+        bail!("unsupported public signing-key version");
+    }
+    if u16::from_be_bytes(data[10..12].try_into().unwrap()) != SIGNATURE_ALG_MLDSA87 {
+        bail!("unsupported public signing-key algorithm");
+    }
+    let encoded: [u8; MLDSA87_PUBLIC_KEY_LEN] = data[16 + SIGNER_KEY_ID_LEN..].try_into().unwrap();
+    let encoded_key = EncodedVerifyingKey::<MlDsa87>::try_from(encoded.as_slice())
+        .map_err(|_| anyhow!("invalid ML-DSA-87 public-key length"))?;
+    let key = MlDsaVerifyingKey::<MlDsa87>::decode(&encoded_key);
+    if key.encode().as_slice() != encoded {
+        bail!("non-canonical ML-DSA-87 public key");
+    }
+    Ok(SigningPublic {
+        id: data[12..12 + SIGNER_KEY_ID_LEN].try_into().unwrap(),
+        epoch: u32::from_be_bytes(
+            data[12 + SIGNER_KEY_ID_LEN..16 + SIGNER_KEY_ID_LEN]
+                .try_into()
+                .unwrap(),
+        ),
+        encoded,
+    })
+}
+
+fn read_signing_public(path: &Path) -> Result<SigningPublic> {
+    let expected = 8 + 2 + 2 + SIGNER_KEY_ID_LEN + 4 + MLDSA87_PUBLIC_KEY_LEN;
+    let data = read_exact_sized(path, expected, "ML-DSA-87 public key")?;
+    decode_signing_public(&data)
+}
+
+fn signing_key_from_secret(secret: &SigningSecret) -> MlDsaSigningKey<MlDsa87> {
+    let mut seed = MlDsaSeed::from(*secret.seed);
+    let signing_key = MlDsaSigningKey::<MlDsa87>::from_seed(&seed);
+    seed.as_mut_slice().zeroize();
+    signing_key
+}
+
+fn verifying_key_from_public(public: &SigningPublic) -> Result<MlDsaVerifyingKey<MlDsa87>> {
+    let encoded = EncodedVerifyingKey::<MlDsa87>::try_from(public.encoded.as_slice())
+        .map_err(|_| anyhow!("invalid ML-DSA-87 public-key length"))?;
+    Ok(MlDsaVerifyingKey::<MlDsa87>::decode(&encoded))
+}
+
 fn parse_root_key_id(value: &str) -> Result<[u8; ROOT_KEY_ID_LEN]> {
     if value.len() != ROOT_KEY_ID_LEN * 2 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!(
@@ -1785,6 +2767,14 @@ fn parse_root_key_id(value: &str) -> Result<[u8; ROOT_KEY_ID_LEN]> {
 }
 
 fn root_key_id_hex(id: &[u8; ROOT_KEY_ID_LEN]) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_signer_key_id(value: &str) -> Result<[u8; SIGNER_KEY_ID_LEN]> {
+    parse_fixed_hex(value, "signer key ID")
+}
+
+fn signer_key_id_hex(id: &[u8; SIGNER_KEY_ID_LEN]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -2088,6 +3078,31 @@ mod tests {
         Ok((public_path, secret_path, root_path))
     }
 
+    fn write_test_signing_keys(
+        dir: &Path,
+        name: &str,
+        id: [u8; SIGNER_KEY_ID_LEN],
+        epoch: u32,
+        seed_start: u8,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let secret = SigningSecret {
+            id,
+            epoch,
+            seed: Zeroizing::new(test_bytes::<MLDSA_SEED_LEN>(seed_start)),
+        };
+        let public_encoded = signing_key_from_secret(&secret).verifying_key().encode();
+        let public = SigningPublic {
+            id,
+            epoch,
+            encoded: public_encoded.as_slice().try_into().unwrap(),
+        };
+        let public_path = dir.join(format!("{name}.mldsa87.pub"));
+        let secret_path = dir.join(format!("{name}.mldsa87.seed"));
+        write_new_file(&public_path, &encode_signing_public(&public), false)?;
+        write_new_file(&secret_path, &encode_signing_secret(&secret), true)?;
+        Ok((public_path, secret_path))
+    }
+
     #[test]
     fn deterministic_phase1_vectors_match_fixtures() {
         assert_eq!(
@@ -2142,7 +3157,45 @@ mod tests {
             .lines()
             .filter(|line| !line.starts_with('#') && !line.is_empty())
             .collect();
-        assert_eq!(records, expected);
+        assert_eq!(records.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn deterministic_phase5_provenance_vector_matches_fixture() {
+        let archive = fixture_hex(include_str!("../test-vectors/one-chunk.pqbk.hex"));
+        let signer_id = test_bytes::<SIGNER_KEY_ID_LEN>(0x81);
+        let secret = SigningSecret {
+            id: signer_id,
+            epoch: 0x0102_0304,
+            seed: Zeroizing::new(test_bytes::<MLDSA_SEED_LEN>(0xa0)),
+        };
+        let signing_key = signing_key_from_secret(&secret);
+        let public = signing_key.verifying_key().encode();
+        let statement = encode_provenance_statement(&signer_id, secret.epoch, archive.len() as u64);
+        let signature: MlDsaSignature<MlDsa87> = signing_key
+            .try_sign_digest(|digest| {
+                digest.update(PROVENANCE_DOMAIN);
+                digest.update(&archive);
+                digest.update(&statement);
+                Ok(())
+            })
+            .unwrap();
+        let signature = signature.encode();
+        let mut signed_archive = archive;
+        signed_archive.extend_from_slice(&statement);
+        signed_archive.extend_from_slice(signature.as_slice());
+        let records = [
+            format!("public-sha256|{}", sha256_hex(public.as_slice())),
+            format!("statement-sha256|{}", sha256_hex(&statement)),
+            format!("signature-sha256|{}", sha256_hex(signature.as_slice())),
+            format!("signed-archive-sha256|{}", sha256_hex(&signed_archive)),
+        ];
+        let expected: Vec<String> = include_str!("../test-vectors/provenance-checksums.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(records.as_slice(), expected.as_slice());
     }
 
     #[test]
@@ -2597,6 +3650,218 @@ unexpected = "field"
         let oversized = "x".repeat(MAX_INVENTORY_LEN as usize + 1);
         assert!(decode_inventory(&oversized).is_err());
         assert!(validate_single_line("safe\u{202e}txt", 200, "label").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn signing_key_files_and_phase5_cli_round_trip() -> Result<()> {
+        let dir = TestDir::new()?;
+        let id = test_bytes::<SIGNER_KEY_ID_LEN>(0x91);
+        let (public_path, secret_path) = write_test_signing_keys(&dir.0, "signer", id, 42, 0xa1)?;
+        let public = read_signing_public(&public_path)?;
+        let secret = read_signing_secret(&secret_path)?;
+        assert_eq!(public.id, id);
+        assert_eq!(public.epoch, 42);
+        assert_eq!(secret.id, id);
+        assert_eq!(secret.epoch, 42);
+        assert_eq!(
+            signing_key_from_secret(&secret)
+                .verifying_key()
+                .encode()
+                .as_slice(),
+            public.encoded
+        );
+        key_info(&public_path, KeyFileKind::SigningPublic)?;
+        key_info(&secret_path, KeyFileKind::SigningSeed)?;
+
+        let cli = Cli::try_parse_from([
+            "pqbackup",
+            "provenance-verify",
+            "archive.pqbk",
+            "--public-key",
+            "signer.pub",
+            "--policy",
+            "signers.toml",
+            "--allow-retired",
+        ])?;
+        match cli.command {
+            Command::ProvenanceVerify { allow_retired, .. } => assert!(allow_retired),
+            _ => panic!("unexpected command"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provenance_authenticates_complete_envelope_and_explicit_identity() -> Result<()> {
+        let dir = TestDir::new()?;
+        let unsigned = dir.0.join("unsigned.pqbk");
+        let signed = dir.0.join("signed.pqbk");
+        fs::write(
+            &unsigned,
+            build_deterministic_vector("backup.txt", b"signed payload", 64).archive,
+        )?;
+        let signer_id = test_bytes::<SIGNER_KEY_ID_LEN>(0x81);
+        let (public, secret) = write_test_signing_keys(&dir.0, "trusted", signer_id, 7, 0xb0)?;
+        let policy = dir.0.join("signers.toml");
+        signer_policy_init(&policy)?;
+        signer_policy_add(
+            &policy,
+            &public,
+            "Test release signer",
+            SignerStatus::Trusted,
+        )?;
+
+        sign_archive(&unsigned, Some(&signed), &secret)?;
+        let layout = scan_archive_layout(&signed)?;
+        let provenance = layout.provenance.as_ref().unwrap();
+        assert_eq!(provenance.signer_key_id, signer_id);
+        assert_eq!(provenance.signer_key_epoch, 7);
+        assert_eq!(provenance.signed_len, layout.envelope_len);
+        verify_provenance(&signed, &public, &policy, false)?;
+
+        let recovery_seed = dir.0.join("vector.mlkem1024.seed");
+        let recovery_root = dir.0.join("vector.root.key");
+        fs::write(&recovery_seed, test_bytes::<MLKEM_SEED_LEN>(0x00))?;
+        fs::write(
+            &recovery_root,
+            encode_root_key(&RootKey {
+                id: test_bytes::<ROOT_KEY_ID_LEN>(0x60),
+                epoch: 0x0102_0304,
+                secret: Zeroizing::new(test_bytes::<ROOT_SECRET_LEN>(0x70)),
+            }),
+        )?;
+        verify_archive(&signed, &recovery_seed, &recovery_root)?;
+
+        let replay = dir.0.join("replayed-copy.pqbk");
+        fs::copy(&signed, &replay)?;
+        verify_provenance(&replay, &public, &policy, false)?;
+
+        let mut modified = fs::read(&signed)?;
+        modified[layout.envelope_len as usize - 1] ^= 1;
+        let modified_path = dir.0.join("modified.pqbk");
+        fs::write(&modified_path, modified)?;
+        assert!(verify_provenance(&modified_path, &public, &policy, false).is_err());
+
+        let (substitute_public, _) =
+            write_test_signing_keys(&dir.0, "substitute", signer_id, 7, 0xc0)?;
+        assert!(verify_provenance(&signed, &substitute_public, &policy, false).is_err());
+        assert!(sign_archive(&signed, None, &secret).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn signer_lifecycle_rejects_retired_by_default_and_always_rejects_revoked() -> Result<()> {
+        let dir = TestDir::new()?;
+        let unsigned = dir.0.join("unsigned.pqbk");
+        let signed = dir.0.join("signed.pqbk");
+        fs::write(
+            &unsigned,
+            build_deterministic_vector("history.txt", b"historical", 64).archive,
+        )?;
+        let signer_id = test_bytes::<SIGNER_KEY_ID_LEN>(0x71);
+        let (public, secret) = write_test_signing_keys(&dir.0, "historical", signer_id, 3, 0xd0)?;
+        let policy = dir.0.join("signers.toml");
+        signer_policy_init(&policy)?;
+        signer_policy_add(&policy, &public, "Historical signer", SignerStatus::Trusted)?;
+        sign_archive(&unsigned, Some(&signed), &secret)?;
+
+        let id = signer_key_id_hex(&signer_id);
+        signer_policy_set_status(&policy, &id, 3, SignerStatus::Retired)?;
+        assert!(verify_provenance(&signed, &public, &policy, false).is_err());
+        verify_provenance(&signed, &public, &policy, true)?;
+
+        signer_policy_set_status(&policy, &id, 3, SignerStatus::Revoked)?;
+        assert!(verify_provenance(&signed, &public, &policy, false).is_err());
+        assert!(verify_provenance(&signed, &public, &policy, true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn older_signed_archive_remains_valid_without_an_external_rollback_catalog() -> Result<()> {
+        let dir = TestDir::new()?;
+        let signer_id = test_bytes::<SIGNER_KEY_ID_LEN>(0x51);
+        let (public, secret) = write_test_signing_keys(&dir.0, "catalog", signer_id, 9, 0xf0)?;
+        let policy = dir.0.join("signers.toml");
+        signer_policy_init(&policy)?;
+        signer_policy_add(
+            &policy,
+            &public,
+            "Catalog test signer",
+            SignerStatus::Trusted,
+        )?;
+
+        for (name, payload) in [
+            ("older", &b"generation 1"[..]),
+            ("newer", &b"generation 2"[..]),
+        ] {
+            let unsigned = dir.0.join(format!("{name}.unsigned.pqbk"));
+            let signed = dir.0.join(format!("{name}.pqbk"));
+            fs::write(
+                &unsigned,
+                build_deterministic_vector("snapshot.txt", payload, 64).archive,
+            )?;
+            sign_archive(&unsigned, Some(&signed), &secret)?;
+            verify_provenance(&signed, &public, &policy, false)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provenance_parser_rejects_truncation_and_extra_trailers() -> Result<()> {
+        let dir = TestDir::new()?;
+        let unsigned = dir.0.join("unsigned.pqbk");
+        let signed = dir.0.join("signed.pqbk");
+        fs::write(
+            &unsigned,
+            build_deterministic_vector("parser.txt", b"parser", 64).archive,
+        )?;
+        let (_, secret) = write_test_signing_keys(
+            &dir.0,
+            "parser",
+            test_bytes::<SIGNER_KEY_ID_LEN>(0x61),
+            1,
+            0xe0,
+        )?;
+        sign_archive(&unsigned, Some(&signed), &secret)?;
+        let bytes = fs::read(&signed)?;
+        let envelope_len = scan_archive_layout(&signed)?.envelope_len as usize;
+
+        for (name, length) in [
+            ("statement", envelope_len + 1),
+            ("signature", bytes.len() - 1),
+        ] {
+            let path = dir.0.join(format!("truncated-{name}.pqbk"));
+            fs::write(&path, &bytes[..length])?;
+            assert!(scan_archive_layout(&path).is_err(), "{name}");
+        }
+        let extra = dir.0.join("extra.pqbk");
+        let mut extra_bytes = bytes;
+        extra_bytes.push(0);
+        fs::write(&extra, extra_bytes)?;
+        assert!(scan_archive_layout(&extra).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_signer_policy_is_rejected() -> Result<()> {
+        let duplicate = r#"format = "PQSIGNERS01"
+
+[[signers]]
+id = "00112233445566778899aabbccddeeff"
+epoch = 1
+identity = "Release signer"
+status = "trusted"
+public_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[signers]]
+id = "00112233445566778899aabbccddeeff"
+epoch = 1
+identity = "Substitute signer"
+status = "trusted"
+public_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+"#;
+        assert!(decode_signer_policy(duplicate).is_err());
+        assert!(decode_signer_policy(&"x".repeat(MAX_SIGNER_POLICY_LEN as usize + 1)).is_err());
         Ok(())
     }
 

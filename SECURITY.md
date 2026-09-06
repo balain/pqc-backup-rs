@@ -40,6 +40,17 @@ root key and epoch on the schedule appropriate for the archive's sensitivity.
 The original filename is encrypted in `PQBACK02`; archive length remains
 visible to support streaming recovery and integrity checks.
 
+## Optional archive provenance
+
+Version 0.0.5 can append an ML-DSA-87 signature over the complete encrypted
+envelope and canonical signer ID/epoch metadata. Verification requires a
+separately authenticated `PQPUBS01` public key and `PQSIGNERS01` trust policy;
+values printed by `inspect` remain unverified.
+
+This identifies who signed exact archive bytes under the supplied policy. It
+does not prove creation time, freshness, uniqueness, or newest-backup status.
+See [`docs/PROVENANCE_POLICY.md`](docs/PROVENANCE_POLICY.md).
+
 If a future attacker breaks ML-KEM but never acquires the root secret, the
 derived KEK should remain unavailable.
 

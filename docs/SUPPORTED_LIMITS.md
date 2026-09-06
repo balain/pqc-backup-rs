@@ -1,6 +1,6 @@
 # Supported limits and environments
 
-**Status:** Phase 4 release baseline (2026-09-06).
+**Status:** Phase 5 engineering baseline (2026-09-06).
 
 ## Supported environment
 
@@ -9,7 +9,7 @@ The security-supported development scope is:
 - 64-bit macOS and Linux;
 - regular local files on filesystems providing reliable same-directory hard links;
 - an operating system CSPRNG available through `getrandom`;
-- the pinned Rust 1.97.1 toolchain when rebuilding release 0.0.4.
+- the pinned Rust 1.97.1 toolchain when rebuilding release 0.0.5.
 
 Windows, network filesystems, cloud-synchronized folders, FUSE filesystems, object-store mounts, unusual removable-media filesystems, containers with weak entropy, and 32-bit targets are not security-supported yet. They may work, but file permissions, atomic publication, durability, and failure behavior have not been validated.
 
@@ -33,9 +33,15 @@ The current Unix implementation creates new secret and inventory files with mode
 | ML-KEM seed | Exactly 64 bytes |
 | Root secret | Exactly 32 bytes inside `PQROOT02` |
 | Root-key inventory | `PQINVENTORY01` UTF-8 TOML, at most 1 MiB |
+| Signing seed | `PQSIGN01`, exactly 64 bytes |
+| Signing public key | `PQPUBS01`, exactly 2624 bytes |
+| Provenance trailer | none, or exactly one 4671-byte `PQSIG001` trailer |
+| ML-DSA-87 signature | exactly 4627 bytes |
+| Signer trust policy | `PQSIGNERS01` UTF-8 TOML, at most 1 MiB |
+| Signer identity | non-empty single line, at most 300 UTF-8 bytes |
 | Wrapped DEK | 32-byte DEK plus 16-byte GCM tag |
 | Existing output | Never overwritten |
-| Trailing archive data | Rejected after authenticated final chunk |
+| Trailing archive data | Rejected unless exactly one canonical `PQSIG001` trailer |
 | Restore/archive temporary files | Same destination directory, mode `0600` on Unix, removed on failure when the OS permits |
 
 The smaller applicable plaintext/chunk-count limit wins. For example, one-byte

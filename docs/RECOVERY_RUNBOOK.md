@@ -1,7 +1,8 @@
 # Recovery runbook
 
-**Applies to:** `PQBACK02`, `PQROOT02`, and `PQINVENTORY01` as shipped with
-`pqbackup` 0.0.4. This project remains experimental and unaudited.
+**Applies to:** `PQBACK02`, `PQROOT02`, `PQINVENTORY01`, and optional
+`PQSIG001` provenance as shipped with `pqbackup` 0.0.5. This project remains
+experimental and unaudited.
 
 This runbook is for recovering data after the original development machine,
 package registry, or normal build environment is unavailable. Keep a printed
@@ -15,6 +16,10 @@ A real archive requires all of the following:
 - its matching 64-byte ML-KEM seed;
 - the `PQROOT02` root-key file whose ID and epoch match the archive;
 - a compatible `pqbackup` binary or the recovery kit needed to rebuild one.
+
+When creator provenance must also be validated, recovery additionally requires
+the matching `PQPUBS01` public key and an authenticated historical
+`PQSIGNERS01` policy. Neither file can decrypt the archive.
 
 The ML-KEM seed and root key must remain in separate custody. Do not place
 either real secret in the recovery kit.
@@ -162,15 +167,18 @@ documented source/lock/toolchain inputs together.
 1. Work on a hardened, offline machine with encrypted local storage and
    controlled swap/hibernation.
 2. Make a read-only working copy of the archive. Do not test the only copy.
-3. Run `inspect` and record the visible root-key ID and epoch. Treat them only
-   as unauthenticated routing hints.
-4. Retrieve the matching root key and ML-KEM seed through their separate
+3. Run `inspect` and record the visible root-key and signer routing metadata.
+   Treat it only as unauthenticated hints.
+4. If provenance matters, retrieve the independently authenticated signer
+   public key and historical policy, then run `provenance-verify`. Record that
+   it does not establish creation time or newest-backup status.
+5. Retrieve the matching root key and ML-KEM seed through their separate
    custody procedures.
-5. Run `verify` before creating plaintext.
-6. Run `open` to a new destination on a local filesystem. Existing files are
+6. Run `verify` before creating plaintext.
+7. Run `open` to a new destination on a local filesystem. Existing files are
    never overwritten.
-7. Validate the recovered application's own hashes or file structure.
-8. Remove both secret media, record the drill, and handle plaintext according
+8. Validate the recovered application's own hashes or file structure.
+9. Remove both secret media, record the drill, and handle plaintext according
    to the data policy. Secure deletion is not guaranteed on SSD, snapshots,
    copy-on-write, or backed-up storage.
 
@@ -187,6 +195,7 @@ contact details in this repository.
 | Refresh removable media | Every five years or earlier per manufacturer guidance | New media identifiers and verified hashes |
 | Review dependencies, standards, and cryptographic status | Every two years and after a material advisory | Review record and migration decision |
 | Confirm owners, locations, and access procedures | Annually and after personnel changes | Approved custody inventory |
+| Verify signer policy history and revocation distribution | Every policy change and annually | Authenticated policy snapshots and change record |
 
 Migrate archives before a primitive, dependency, operating environment, or
 storage medium leaves the organization's accepted risk boundary. Never destroy

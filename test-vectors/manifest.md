@@ -14,6 +14,9 @@ These vectors freeze the `PQBACK02` byte layout and cryptographic domain separat
 - Filename-metadata nonce: bytes `d0` through `db`.
 - DEK: bytes `e0` through `ff`.
 - Root-key epoch: `0x01020304`.
+- ML-DSA-87 signing seed: bytes `a0` through `bf`.
+- Signer-key ID: bytes `81` through `90`.
+- Signer-key epoch: `0x01020304`.
 
 ML-KEM uses the fixed seed's derived encapsulation key and deterministic test-only encapsulation. Production code does not expose deterministic randomness.
 
@@ -33,6 +36,12 @@ ML-KEM uses the fixed seed's derived encapsulation key and deterministic test-on
 - `mlkem-seed.hex`: public deterministic ML-KEM seed for offline restore drills.
 - `root-key.hex`: complete canonical `PQROOT02` key file as lowercase hex.
 - `checksums.txt`: plaintext and component/archive hashes for all cases.
+- `provenance-checksums.txt`: ML-DSA-87 public key, canonical statement,
+  signature, and complete signed-archive SHA-256 values for the one-chunk case.
 - `negative-vectors.md`: mutations and required error categories.
 
-The Rust unit test reconstructs each vector, compares all hashes, and compares the complete one-chunk archive byte-for-byte. Any unintended byte-layout or domain-separator change fails the test.
+The Rust unit tests reconstruct each vector, compare all hashes, and compare
+the complete unsigned one-chunk archive byte-for-byte. ML-DSA deterministic
+signature hashes freeze the provenance domain, coverage, metadata statement,
+and signature encoding. Any unintended byte-layout or domain-separator change
+fails a test.

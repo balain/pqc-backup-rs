@@ -22,6 +22,8 @@ Security policy and planning documents:
 - [Decoder error categories](docs/ERROR_CATEGORIES.md)
 - [Key management and custody](docs/KEY_MANAGEMENT.md)
 - [PQINVENTORY01 format](docs/PQINVENTORY01_FORMAT.md)
+- [PQBACK02 provenance extension](docs/PQBACK02_PROVENANCE_FORMAT.md)
+- [Provenance and signer policy](docs/PROVENANCE_POLICY.md)
 - [Long-term security assessment](docs/LONG_TERM_SECURITY_ASSESSMENT.md)
 - [Improvement plan](docs/IMPROVEMENT_PLAN.md)
 - [Parser fuzzing](docs/FUZZING.md)
@@ -37,12 +39,12 @@ After building, run the self-contained demonstration in a new directory:
 target/release/pqbackup demo --out-dir ./pqbackup-demo
 ```
 
-The command creates a harmless sample file, ML-KEM keys, a root key, a
-secret-free custody inventory, an encrypted archive, and a restored copy. It
-then locates the archive's inventory entry and compares the restored file to
-the input. It does not overwrite an existing demo directory. The demo keeps
-both recovery secrets together for convenience only; do not copy that custody
-pattern for real backups.
+The command creates a harmless sample file, ML-KEM keys, a root key, an
+ML-DSA-87 signer, secret-free custody and trust-policy files, a signed encrypted
+archive, and a restored copy. It verifies both archive provenance and encrypted
+content before comparing the restored file to the input. It does not overwrite
+existing output files. The demo keeps all secrets together for convenience
+only; do not copy that custody pattern for real backups.
 
 ## Cryptographic design
 
@@ -59,6 +61,8 @@ For each backup:
    AES-256-GCM.
 6. Store the ML-KEM ciphertext, salt, nonces, encrypted filename metadata,
    wrapped DEK, and encrypted data in the `PQBACK02` envelope.
+7. Optionally sign the complete encrypted envelope and canonical signer
+   metadata with ML-DSA-87, then verify it against a separately trusted policy.
 
 The archive is therefore not recoverable from the stored ciphertext and ML-KEM
 material alone. Recovery requires **both**:
@@ -135,11 +139,16 @@ media refresh, and migration drills.
 ```text
 pqbackup keygen-kem  --out-dir DIR [--name NAME]
 pqbackup keygen-root --output PATH [--root-key-id HEX] [--root-key-epoch N]
+pqbackup keygen-signing --out-dir DIR [--name NAME]
+               [--signer-key-id HEX] [--signer-key-epoch N]
 pqbackup seal INPUT --public-key PATH --root-secret PATH [-o OUTPUT]
                [--chunk-size BYTES] [--expect-root-key-id HEX]
                [--expect-root-key-epoch N]
 pqbackup inspect ARCHIVE.pqbk
-pqbackup key-info PATH --kind root|kem-public|kem-seed|archive
+pqbackup sign ARCHIVE.pqbk --signing-key PATH [-o SIGNED.pqbk]
+pqbackup provenance-verify SIGNED.pqbk --public-key PATH --policy PATH
+               [--allow-retired]
+pqbackup key-info PATH --kind root|kem-public|kem-seed|archive|signing-public|signing-seed
 pqbackup inventory init INVENTORY.toml
 pqbackup inventory add INVENTORY.toml --root-secret PATH --label TEXT
                --custody TEXT [--custody TEXT] [--status STATUS]
@@ -148,6 +157,13 @@ pqbackup inventory check INVENTORY.toml
 pqbackup inventory locate INVENTORY.toml ARCHIVE.pqbk
 pqbackup inventory set-status INVENTORY.toml --root-key-id HEX
                --root-key-epoch N --status STATUS
+pqbackup signer-policy init POLICY.toml
+pqbackup signer-policy add POLICY.toml --public-key PATH --identity TEXT
+               [--status trusted|retired|revoked]
+pqbackup signer-policy list POLICY.toml
+pqbackup signer-policy check POLICY.toml
+pqbackup signer-policy set-status POLICY.toml --signer-key-id HEX
+               --signer-key-epoch N --status trusted|retired|revoked
 pqbackup verify ARCHIVE.pqbk --secret-key PATH --root-secret PATH
 pqbackup open ARCHIVE.pqbk --secret-key PATH --root-secret PATH [-o OUTPUT]
 pqbackup demo [--out-dir DIR]
@@ -156,7 +172,7 @@ pqbackup demo [--out-dir DIR]
 Run `pqbackup <command> --help` for the complete argument help. Commands that
 create keys, archives, demos, or inventories refuse to overwrite files.
 `inventory add` and `inventory set-status` atomically update an existing
-inventory.
+inventory. Signer-policy updates are also atomic.
 
 ## One-time setup
 
@@ -257,6 +273,40 @@ physically separate locations.
 
 Do not put the two secrets next to the encrypted backup.
 
+### Optional provenance setup
+
+Archive signing is separate from encryption and recovery. Generate the signing
+seed in its own protected location:
+
+```bash
+pqbackup keygen-signing \
+  --out-dir /Volumes/SIGNING-KEY \
+  --name home-archive-signer \
+  --signer-key-epoch 2026
+
+pqbackup key-info \
+  /Volumes/SIGNING-KEY/home-archive-signer.mldsa87.pub \
+  --kind signing-public
+```
+
+Create the trust policy on a verification system and bind the public-key
+fingerprint to a meaningful identity:
+
+```bash
+pqbackup signer-policy init ./signer-policy.toml
+
+pqbackup signer-policy add ./signer-policy.toml \
+  --public-key /Volumes/SIGNING-KEY/home-archive-signer.mldsa87.pub \
+  --identity "Home backup signing key"
+
+pqbackup signer-policy check ./signer-policy.toml
+pqbackup signer-policy list ./signer-policy.toml
+```
+
+Authenticate the public key and policy through a channel independent from the
+archive storage. The policy contains no secret bytes, but an attacker who can
+replace it can substitute a signer identity.
+
 ## Encrypt a backup
 
 Assume the root-secret USB is mounted temporarily:
@@ -293,9 +343,44 @@ It changes streaming/memory behavior, not the required recovery materials.
 After sealing:
 
 1. Unmount the root-secret media.
-2. Copy the `.pqbk` file to the backup destination(s).
-3. Optionally delete the plaintext `.tgz` only after verification and according
+2. If provenance is required, sign the unsigned archive.
+3. Copy the final `.pqbk` file to the backup destination(s).
+4. Optionally delete the plaintext `.tgz` only after verification and according
    to your retention policy.
+
+## Sign an encrypted archive
+
+Signing is a separate operation so the provenance seed never needs to coexist
+with the plaintext or either recovery secret:
+
+```bash
+pqbackup sign backup-2026-09-05.tgz.pqbk \
+  --signing-key /Volumes/SIGNING-KEY/home-archive-signer.mldsa87.seed \
+  --output backup-2026-09-05.signed.pqbk
+```
+
+The command copies the complete unsigned envelope, appends one canonical
+ML-DSA-87 trailer, verifies the resulting structure, and atomically publishes
+the signed output. It refuses to overwrite files or sign an already signed
+archive. Preserve the unsigned source until the signed copy verifies.
+
+Verify creator provenance without recovery secrets:
+
+```bash
+pqbackup provenance-verify backup-2026-09-05.signed.pqbk \
+  --public-key ./home-archive-signer.mldsa87.pub \
+  --policy ./signer-policy.toml
+```
+
+This verifies the exact encrypted bytes, signer ID/epoch, public-key
+fingerprint, trusted human identity, and lifecycle state. A `retired` signer is
+rejected unless `--allow-retired` is explicitly supplied for an approved
+historical archive. A `revoked` signer is always rejected.
+
+Signatures do not prove creation time or freshness. A replayed valid archive
+still verifies; use an authenticated external catalog or trusted timestamp when
+rollback detection is required. See the
+[provenance policy](docs/PROVENANCE_POLICY.md).
 
 ## Inspect without decrypting
 
@@ -303,14 +388,16 @@ After sealing:
 pqbackup inspect backup-2026-09-05.tgz.pqbk
 ```
 
-`inspect` intentionally does not reveal the original filename. It displays the
+`inspect` intentionally does not reveal the original filename or trusted signer
+identity. It displays the
 format, algorithms, file length, chunk size, root-key ID, root-key epoch, and
-envelope sizes only.
+envelope size. For a signed archive it also reports an unverified signature
+presence, signer ID, and signer epoch.
 
 An inspect result contains attacker-controlled, unauthenticated routing data
 until recovery keys validate the archive. It is not proof of the root key,
-epoch, creator, or archive history. Archive length and root-key ID/epoch may
-also be operationally sensitive.
+epoch, creator, or archive history. Use `provenance-verify` for creator identity.
+Archive length and key IDs/epochs may also be operationally sensitive.
 
 Locate the matching custody record without mounting either recovery secret:
 
@@ -344,6 +431,10 @@ The restore is written to a same-directory temporary file and atomically
 published without overwriting an existing name only after every chunk
 authenticates. A failed restore leaves no completed output file.
 
+`open` authenticates encryption but does not make a signer-trust decision. If a
+provenance trailer is present, it is structurally validated and the command
+prints a reminder to run `provenance-verify` separately.
+
 ## Verify without writing plaintext
 
 Use `verify` after copying an archive to another medium and before deleting a
@@ -357,6 +448,8 @@ pqbackup verify /Volumes/BACKUPS/home-2026-09-05.pqbk \
 
 Verification requires both recovery secrets because it decrypts and
 authenticates every payload chunk, but it does not create a plaintext file.
+This `verify` command checks encrypted-content integrity, not creator identity;
+use `provenance-verify` for the separate signer-policy decision.
 
 ## Suggested backup workflow
 
@@ -408,7 +501,9 @@ The final flag is authenticated. Restore rejects:
 - modified chunks;
 - missing chunks;
 - truncation before the final chunk;
-- trailing data after the final chunk.
+- trailing data after the final chunk unless it is exactly one well-formed
+  `PQSIG001` provenance trailer;
+- truncated, nested, malformed, or extra provenance data.
 
 Each backup uses a fresh random DEK and nonce prefix, so AES-GCM nonces are not
 reused under the same DEK.
@@ -428,9 +523,12 @@ frame allocations are bounded before memory is allocated. See
 - This project has not itself received a security review.
 - The original filename is encrypted and authenticated in `PQBACK02`. File
   length remains visible to support streaming and recovery checks.
-- No ML-DSA signature is included in v2. AES-GCM authenticates the encrypted
-  archive to a holder of the keys, but it does not provide third-party sender
-  attribution.
+- An optional ML-DSA-87 extension provides creator attribution only when its
+  public key and signer policy were authenticated independently. The upstream
+  RustCrypto `ml-dsa` implementation and this integration are not independently
+  audited.
+- Archive signatures do not provide a trusted time, append-only history,
+  deletion detection, uniqueness, or newest-backup selection.
 - Secure deletion of the plaintext `.tgz` is filesystem/SSD dependent and is
   intentionally outside this tool.
 - Long-term backup safety also depends on preserving the recovery secrets,
@@ -448,10 +546,12 @@ Before relying on an archive:
 2. Keep at least two controlled copies of each recovery secret in separate
    locations.
 3. Run `verify` on the completed archive and again after copying it elsewhere.
-4. Retain this source code, `Cargo.lock`, a known-good binary, test archive,
+4. If provenance matters, run `provenance-verify` using a protected trust
+   policy and retain historical signer public keys and policy snapshots.
+5. Retain this source code, `Cargo.lock`, a known-good binary, test archive,
    and restore instructions with the recovery materials.
-5. Practice a complete restore periodically on a separate machine or directory.
-6. Rotate to a new root key and epoch according to your retention and risk
+6. Practice a complete restore periodically on a separate machine or directory.
+7. Rotate to new recovery and signing epochs according to your retention and risk
    policy; retain old root keys while any archive using them still matters.
 
 ## Troubleshooting
@@ -469,6 +569,14 @@ reported by `inspect`.
 `DEK unwrap failed` or filename authentication failure means a recovery secret
 is incorrect, corrupt, or the archive has been modified. Do not retry with
 untrusted replacement files; identify the correct custody copies first.
+
+`archive provenance signature is invalid` means the encrypted envelope or
+signed metadata changed, or the supplied public key is not the signing key.
+
+`public key fingerprint does not match the trusted signer policy` means the
+key file and policy disagree. Stop and authenticate both through the approved
+distribution channel; do not add the replacement key merely to make
+verification pass.
 
 ## Crypto migration
 

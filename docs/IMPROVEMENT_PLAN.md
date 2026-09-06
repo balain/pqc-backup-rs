@@ -4,7 +4,7 @@
 **Basis:** [Long-term security assessment](./LONG_TERM_SECURITY_ASSESSMENT.md)  
 **Current format:** `PQBACK02` archives and `PQROOT02` root keys
 
-**Phase status:** Phases 0, 1, and 2 completed on 2026-09-06. Phase 3 engineering completed on 2026-09-06; its operator recovery-drill gate remains pending. Phase 4 engineering completed on 2026-09-06; signed-tag, two-person verification, separate-copy, and scheduled-owner gates remain pending. Later phases remain planned.
+**Phase status:** Phases 0, 1, and 2 completed on 2026-09-06. Phase 3 engineering completed on 2026-09-06; its operator recovery-drill gate remains pending. Phase 4 engineering completed on 2026-09-06; signed-tag, two-person verification, separate-copy, and scheduled-owner gates remain pending. Phase 5 engineering completed on 2026-09-06; independent approval remains a Phase 6 gate.
 
 ## Objective
 
@@ -261,7 +261,19 @@ cannot be satisfied by repository changes alone and remain pending.
 
 ## Phase 5 — Add provenance only if required
 
-**Goal:** provide creator authentication and substitution/rollback evidence without confusing it with encryption integrity.
+**Engineering status: Completed (2026-09-06).** `PQSIG001` uses ML-DSA-87
+to sign the exact frozen `PQBACK02` envelope plus canonical signer metadata.
+Separate key generation, signing, verification, and `PQSIGNERS01` policy
+commands implement trusted/retired/revoked lifecycle behavior. Specifications,
+operator policy, migration guidance, parser fuzz targets, and substitution,
+replay, mutation, wrong-key, retired, revoked, truncation, and extra-data tests
+are included. A valid replay intentionally remains valid; trusted time and
+rollback selection require an external authenticated catalog. Independent
+reviewer approval is not an engineering deliverable and remains pending.
+
+**Goal:** provide creator authentication and substitution evidence, plus an
+explicit foundation for external rollback controls, without confusing any of
+them with encryption integrity.
 
 This phase is conditional. Skip it if the product only needs confidentiality and holder-authenticated integrity.
 

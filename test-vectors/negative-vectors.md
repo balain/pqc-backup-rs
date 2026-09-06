@@ -21,8 +21,16 @@ Apply each mutation to decoded `one-chunk.pqbk.hex` bytes. Offsets include the f
 | N15 | Change data ciphertext | Chunk authentication failure |
 | N16 | Remove final byte | Truncated chunk |
 | N17 | Append one byte | Unexpected trailing data |
+| N18 | Append only a prefix of the 44-byte `PQSIG001` statement | Truncated provenance |
+| N19 | Change any byte of a signed encrypted envelope | Invalid provenance signature or invalid envelope structure |
+| N20 | Change signer ID, epoch, algorithm, signed length, or signature length | Provenance metadata/coverage failure |
+| N21 | Change one ML-DSA-87 signature byte | Invalid provenance signature |
+| N22 | Supply a different public key with the same self-asserted ID/epoch | Invalid signature or policy fingerprint mismatch |
+| N23 | Verify a trusted signature after its policy record becomes retired | Historical signer rejected unless explicitly allowed |
+| N24 | Verify a trusted signature after its policy record becomes revoked | Revoked signer rejected even when retired keys are allowed |
+| N25 | Append a second trailer or byte after a complete trailer | Unexpected trailing data |
+| N26 | Copy a complete signed archive byte-for-byte | Signature remains valid; external catalog required to detect replay |
 
 Calculate variable-field offsets after the ML-KEM ciphertext from the format specification by reading the KEM, encrypted-filename, and wrapped-DEK lengths.
 
 Exact error text is not an interoperability contract. Implementations must map failures to the listed category and must not emit a completed plaintext output. Phase 2 converts these recipes into an automated corruption corpus.
-

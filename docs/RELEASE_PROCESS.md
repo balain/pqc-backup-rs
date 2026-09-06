@@ -1,7 +1,8 @@
 # Release process
 
 This process produces the independently verifiable artifacts required by
-Phase 4. It does not change the frozen `PQBACK02` format.
+Phase 4. The unsigned `PQBACK02` envelope remains frozen; version 0.0.5 adds
+the separately specified optional `PQSIG001` archive-provenance extension.
 
 ## Release gates
 

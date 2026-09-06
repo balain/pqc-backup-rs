@@ -1,7 +1,7 @@
 # Risk register
 
 **Owner role:** “Maintainer” means the project maintainer until a named owner is assigned.  
-**Status values:** Open, Mitigated, Accepted/deferred, or External dependency.
+**Status values:** Open, Partially mitigated, Mitigated, Accepted/deferred, or External dependency.
 
 | ID | Risk | Severity | Status | Owner | Planned control / evidence |
 | --- | --- | --- | --- | --- | --- |
@@ -12,17 +12,19 @@
 | R-005 | Co-locating both recovery secrets defeats separation | Critical | Mitigated | Operator | Combined `keygen` removed; separate commands and explicit demo warning implemented in Phase 0. |
 | R-006 | Loss of either secret class makes archives unrecoverable | Critical | Open | Operator | Phase 3 added inventory tooling and a two-copy recovery-drill procedure; remains open until operators provision and exercise independent copies. |
 | R-007 | No explicit conservative archive-size/chunk-count enforcement | High | Mitigated | Maintainer | Phase 2 enforces and boundary-tests 1 TiB plaintext and 2^20 data-frame ceilings. |
-| R-008 | No creator authentication, timestamp, or rollback protection | Medium | Accepted/deferred | Product owner | Explicitly out of current scope; Phase 5 only after trust/revocation design. |
+| R-008 | Creator authentication, timestamp, or rollback evidence is absent or misinterpreted | Medium | Partially mitigated | Product owner | Phase 5 adds ML-DSA-87 creator authentication and lifecycle policy. Trusted time and rollback detection still require an external catalog. |
 | R-009 | Visible length and routing metadata enable inference | Medium | Accepted/deferred | Product owner | Document exposure; padding/profile decision requires a future format design. |
 | R-010 | `inspect` metadata may be attacker-controlled | Medium | Mitigated | Operator | CLI/docs label it unauthenticated routing data; recovery AEAD remains authoritative. |
 | R-011 | Secret zeroization cannot prevent swap, dumps, or OS inspection | High | Open | Maintainer | Phase 3 documents host controls and added a non-exportable-provider boundary; memory locking and an approved hardware backend remain open. |
 | R-012 | Filename portability and normalization rules are incomplete | High | Mitigated | Maintainer | Supported scope is macOS/Linux; v2 preserves UTF-8 without normalization and rejects unsafe single-component names, with path-misuse tests. |
 | R-013 | Dependency or build supply-chain compromise | High | Mitigated | Maintainer | Phase 4 pins tool/action versions, checks advisories/licenses/sources, compares clean native builds, publishes an SBOM, and attests release assets. Maintainer-signed tags remain an operational gate. |
 | R-014 | Future environment may not rebuild or run the decoder | Critical | Mitigated | Maintainer | Phase 4 publishes an attested kit with source, vendored dependencies, toolchain/lock inputs, binaries, vectors, and an offline test. Separate physical copies and human drills remain operator gates. |
-| R-015 | Storage deletion, corruption, or replay remains possible | High | Accepted/deferred | Operator | Independent archive copies and catalogs; provenance option in Phase 5. |
+| R-015 | Storage deletion, corruption, replay, or rollback remains possible | High | Accepted/deferred | Operator | Phase 5 detects modified/substituted signed bytes but valid replays remain valid; use independent copies and an authenticated append-only catalog. |
 | R-016 | No formal compliance or cryptographic-module validation | High | Accepted/deferred | Product owner | Prohibit such claims; deployment-specific compliance work after Phase 6. |
 | R-017 | Demo mode intentionally co-locates disposable secrets | Medium | Mitigated | Maintainer | Prominent runtime warning and documentation; demo files must never become production keys. |
 | R-018 | Supported filesystem/OS behavior is not broadly validated | Medium | Open | Maintainer | Phase 3 atomically creates Unix secret/inventory files with mode `0600` and tests permissions; broader platform/filesystem validation remains open. |
+| R-019 | `ml-dsa` 0.1.1 and the Phase 5 signature integration lack independent audit | High | External dependency | Maintainer | Track upstream advisories; preserve explicit experimental status; review construction and implementation in Phase 6. |
+| R-020 | Signer trust policy or public-key substitution can forge identity decisions | High | Open | Operator | Phase 5 binds ID/epoch/fingerprint and rejects duplicates; deployments must authenticate policy distribution and retain policy history. |
 
 ## Phase 0 disposition
 

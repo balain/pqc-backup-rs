@@ -1,0 +1,5 @@
+# Deterministic ML-DSA-87 provenance vector checksums; signing seed bytes are a0..bf.
+public-sha256|5c7f78c4e81b02501828895ff61f0bc5d8ebcd104a13e10966a5679a41aee19e
+statement-sha256|7428b6f4cd9669505eb2c3166b117ed4ebcf148acf0a1f785891945b2b486f50
+signature-sha256|6b8a80cffaca725c0b81b77d8740670cf722cc438443950c44973c4268ac3ebf
+signed-archive-sha256|772a575a9c89a550ba9a23ca50155e661002828fcd223adeb1446af09fcaf212
