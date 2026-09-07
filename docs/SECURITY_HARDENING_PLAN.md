@@ -2,7 +2,7 @@
 
 **Created:** 2026-09-07  
 **Baseline reviewed:** package version 0.1.1  
-**Status:** Phase 1 engineering complete in 0.1.2; Phases 2–6 planned  
+**Status:** Phases 1 and 2 engineering complete in 0.1.2 and 0.1.3; Phases 3–6 planned
 **Constraint:** external review, third-party validation, and certification are not feasible at this time
 
 ## Purpose and scope
@@ -73,8 +73,8 @@ risk, implement Phase 5 before Phase 4.
 
 ## Phase 1: Make verification a single, enforceable decision
 
-**Status:** Engineering complete, 2026-09-07, package 0.1.2. Changes are in the
-working tree; no implementation commit or published release is asserted here.
+**Status:** Engineering complete, 2026-09-07, package 0.1.2, recorded in
+Phase 1 commit `76bb957`; no published release is asserted here.
 
 Implemented a shared streaming reader that feeds the signature digest and
 whole-archive SHA-256 from exactly the parsed bytes. Signature hashing stops at
@@ -167,6 +167,41 @@ failure; operators currently cannot require trusted provenance in one restore.
 and updated provenance policy and command documentation.
 
 ## Phase 2: Harden secrets, file reads, and publication
+
+**Status:** Engineering complete, 2026-09-07, package 0.1.3. Phase 2 changes are
+in the working tree; no commit or published release is asserted for them.
+
+Implemented zeroizing secret serialization, KDF buffers, exported ML-KEM material,
+and decrypted filenames; shortened recovery-secret lifetimes; removed additional
+plaintext buffered I/O. Material files now use bounded descriptor-based reads,
+reject non-regular files and final-component symlinks, and enforce secret UID/mode
+checks on supported Unix systems. Parent-directory trust and extended ACL review
+remain explicit operator requirements.
+
+New key files are staged before publication; key-pair failure preserves any
+already-published secret with an incomplete-generation error. New key directories
+use mode 0700. File publication, replacement, and successful cleanup synchronize
+parent directories, and post-publication errors explain that output already exists.
+
+Internal evidence:
+
+- `cargo test --locked --offline`: 42 tests passed, including seven new Phase 2
+  tests for bounded/growing input, material-file restrictions, partial and failed
+  staging, post-publication failure reporting, incomplete key pairs, and SIGKILL
+  remnants in a disposable subprocess.
+- `cargo clippy --locked --offline --all-targets --all-features -- -D warnings`:
+  passed.
+- `cargo check --manifest-path fuzz/Cargo.toml --offline`: all existing fuzz
+  targets compile with the updated source and lockfile; no new fuzz campaign
+  is claimed.
+- Locked offline build and the expanded controlled-pilot script passed locally.
+- Existing deterministic archive/root/signature vectors remain unchanged.
+
+See [secret handling](./SECRET_HANDLING.md) for the lifetime inventory, dependency
+cleanup findings, strict permissions/symlink policy, manual remnant cleanup, and
+core-dump/page-locking assessment. Memory locking and platform-wide dump control
+are not implemented or claimed. Tests establish local software behavior, not
+physical power-loss guarantees, extended ACL enforcement, or other-platform results.
 
 ### 2.1 Reduce unprotected copies in memory
 
@@ -498,8 +533,8 @@ remaining limitations, and responsible owner. Use these states consistently:
 | Operationally tested | Required physical-device or real-custody tests pass |
 | Deferred | Work cannot currently proceed; reason and recovery path are recorded |
 
-Phase 1 is **Engineering complete** in 0.1.2, with evidence above. Phases 2–6
-remain **Planned**. Bump the package patch version once for each subsequently
+Phases 1 and 2 are **Engineering complete** in 0.1.2 and 0.1.3, with evidence
+above. Phases 3–6 remain **Planned**. Bump the package patch version once for each subsequently
 completed implementation phase, updating Cargo.toml, Cargo.lock, and changelog
 together. External assurance remains deferred and is tracked separately from
 the owner-controlled acceptance criteria above.

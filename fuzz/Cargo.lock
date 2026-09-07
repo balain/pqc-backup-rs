@@ -510,6 +510,7 @@ dependencies = [
  "clap",
  "getrandom",
  "hkdf",
+ "libc",
  "libfuzzer-sys",
  "ml-dsa",
  "ml-kem",

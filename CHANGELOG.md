@@ -4,6 +4,17 @@ All notable security-relevant and user-visible changes are recorded here.
 
 ## Unreleased
 
+## 0.1.3 - 2026-09-07
+
+### Security hardening plan — Phase 2
+
+- Protected serialized secrets, KDF input/output, exported ML-KEM material, plaintext chunks, and decrypted filenames with zeroizing containers; reduced secret lifetimes and removed extra plaintext buffered I/O.
+- Added bounded descriptor-based key/policy/inventory reads, non-regular-file and final-symlink rejection, and current-user/permission enforcement for secret files. Imported permissive secrets require an explicit custody/permission correction.
+- Staged complete key files before no-overwrite publication, synchronized parent directories, and added explicit output-already-published errors for later durability or cleanup failures.
+- Staged key pairs together, preserved already-published secrets on incomplete generation, created new key directories with mode 0700, and rejected path components in KEM key names.
+- Added failure-injection, permission/input-limit, and killed-subprocess remnant tests, plus secret-lifetime and manual recovery/cleanup documentation.
+- Added a direct Unix libc dependency for open flags and effective-user checks using the already locked version; archive formats and cryptographic parameters are unchanged.
+
 ## 0.1.2 - 2026-09-07
 
 ### Security hardening plan — Phase 1

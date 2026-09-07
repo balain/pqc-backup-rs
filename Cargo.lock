@@ -459,13 +459,14 @@ dependencies = [
 
 [[package]]
 name = "pqbackup"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "clap",
  "getrandom",
  "hkdf",
+ "libc",
  "ml-dsa",
  "ml-kem",
  "serde",

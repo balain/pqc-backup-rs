@@ -1,7 +1,8 @@
 # Recovery runbook
 
 **Applies to:** `PQBACK02`, `PQROOT02`, `PQINVENTORY01`, and optional
-`PQSIG001` provenance, including required-provenance recovery in `pqbackup` 0.1.2. This project remains
+`PQSIG001` provenance, including required-provenance recovery and strict key-file
+handling in `pqbackup` 0.1.3. This project remains
 experimental and unaudited.
 
 This runbook is for recovering data after the original development machine,
@@ -110,6 +111,7 @@ archives. Convert the hexadecimal fixtures in a temporary test directory:
 
 ```bash
 mkdir vector-check
+umask 077
 sed '/^#/d' source/test-vectors/one-chunk.pqbk.hex | \
   xxd -r -p > vector-check/one-chunk.pqbk
 xxd -r -p source/test-vectors/mlkem-seed.hex \
@@ -186,6 +188,25 @@ documented source/lock/toolchain inputs together.
 9. Remove both secret media, record the drill, and handle plaintext according
    to the data policy. Secure deletion is not guaranteed on SSD, snapshots,
    copy-on-write, or backed-up storage.
+
+## Key permissions and interrupted operations (0.1.3)
+
+Recovery seeds and root keys must be owned by the current effective user, with
+no group/other Unix permissions (normally mode `0600` or `0400`). Use verified
+regular file paths rather than final-component symlinks. The program does not
+silently change permissions or resolve a link. Review extended ACLs and trusted
+parent directories separately before correcting imported material.
+
+If an operation reports that output was published but durability/cleanup failed,
+inspect and verify that destination before retrying. A nonzero exit is not proof
+that no output exists. If key-pair generation is incomplete, retain and isolate
+any published secret and inspect both paths; do not overwrite them during retry.
+
+Abrupt termination can leave a private plaintext temporary file. Follow the
+[manual inspection and cleanup procedure](./SECRET_HANDLING.md#abandoned-plaintext-temporary-files):
+confirm the job has stopped, inspect the exact owned regular file and directory,
+then remove only that individually verified candidate. Do not promote remnants
+or use wildcard cleanup. Restart full authenticated recovery into a new output.
 
 ## Scheduled preservation work
 

@@ -230,6 +230,12 @@ pqbackup keygen-root \
   --root-key-epoch 2026
 ```
 
+Version 0.1.3 requires secret files to be owned by the current effective user
+with no group/other Unix permissions (normally `0600` or `0400`). Material reads
+reject final-component symlinks and non-regular files. Check custody and ACLs
+before correcting permissions on imported keys; select the verified real path
+for intentional links. See [secret handling](docs/SECRET_HANDLING.md).
+
 The root-key file is binary. Do not open it in an editor, send it by email, or
 treat it as a password string. Existing v1 raw 32-byte root-secret files are
 not valid v2 root-key files: generate a fresh `PQROOT02` root key before
@@ -451,7 +457,11 @@ explicitly, always pass `--output` in scripts.
 
 The restore is written to a same-directory temporary file and atomically
 published without overwriting an existing name only after every chunk
-authenticates. A failed restore leaves no completed output file.
+authenticates. Authentication failure leaves no completed output file. If
+publication succeeds but directory synchronization or cleanup fails, the error
+explicitly reports that output was published; inspect it before retrying.
+Abrupt termination may leave a private plaintext temporary file; follow the
+[manual cleanup procedure](docs/SECRET_HANDLING.md#abandoned-plaintext-temporary-files).
 
 By default, `open` authenticates encryption and only structurally validates any
 provenance trailer. To require an approved signer before publishing plaintext:

@@ -66,7 +66,7 @@ const MAX_SIGNER_IDENTITY_LEN: usize = 300;
 
 struct DecryptedArchive {
     header: Header,
-    original_name: String,
+    original_name: Zeroizing<String>,
     provenance: Option<ProvenanceTrailer>,
 }
 
@@ -128,9 +128,20 @@ impl TemporaryFile {
         }
     }
 
+    fn create(destination: &Path, private: bool) -> Result<(Self, File)> {
+        let path = temporary_output_path(destination)?;
+        let file = if private {
+            create_private_new(&path)
+        } else {
+            create_new(&path)
+        }?;
+        Ok((Self::new(path), file))
+    }
+
     fn commit(mut self, destination: &Path) -> Result<()> {
         // A hard link publishes the completed inode atomically and fails if the destination
         // appeared after our earlier collision check. This avoids rename's overwrite race.
+        io_checkpoint("publish.link")?;
         fs::hard_link(&self.path, destination).with_context(|| {
             format!(
                 "publishing verified temporary output {} as {}",
@@ -138,13 +149,19 @@ impl TemporaryFile {
                 destination.display()
             )
         })?;
-        fs::remove_file(&self.path)
-            .with_context(|| format!("removing temporary output {}", self.path.display()))?;
-        self.committed = true;
-        Ok(())
+        (|| -> Result<()> {
+            sync_parent(destination)?;
+            io_checkpoint("publish.unlink")?;
+            fs::remove_file(&self.path)?;
+            self.committed = true;
+            sync_parent(destination)
+        })().with_context(|| format!(
+            "output {} was published, but cleanup or directory durability confirmation failed; inspect it before retrying", destination.display()
+        ))
     }
 
     fn replace(mut self, destination: &Path) -> Result<()> {
+        io_checkpoint("publish.rename")?;
         fs::rename(&self.path, destination).with_context(|| {
             format!(
                 "replacing {} with temporary file {}",
@@ -153,14 +170,16 @@ impl TemporaryFile {
             )
         })?;
         self.committed = true;
-        Ok(())
+        sync_parent(destination).with_context(|| format!(
+            "output {} was replaced, but directory durability confirmation failed; inspect it before retrying", destination.display()
+        ))
     }
 }
 
 impl Drop for TemporaryFile {
     fn drop(&mut self) {
-        if !self.committed {
-            let _ = fs::remove_file(&self.path);
+        if !self.committed && fs::remove_file(&self.path).is_ok() {
+            let _ = sync_parent(&self.path);
         }
     }
 }
@@ -501,7 +520,6 @@ struct Header {
     wrapped_dek: Vec<u8>,
 }
 
-#[derive(Debug)]
 struct RootKey {
     id: [u8; ROOT_KEY_ID_LEN],
     epoch: u32,
@@ -722,19 +740,28 @@ fn demo(out_dir: &Path) -> Result<()> {
 }
 
 fn keygen_kem(out_dir: &Path, name: &str) -> Result<()> {
-    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    validate_single_line(name, MAX_FILENAME_LEN, "KEM-key name")?;
+    if Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name) {
+        bail!("KEM-key name must be a safe single path component");
+    }
+    create_key_directory(out_dir)?;
 
     let (dk, ek) = MlKem1024::generate_keypair();
     let seed = dk
         .to_seed()
         .ok_or_else(|| anyhow!("ML-KEM key generation did not retain a seed"))?;
+    let seed = Zeroizing::new(seed);
     let public_bytes = ek.to_bytes();
 
     let pub_path = out_dir.join(format!("{name}.mlkem1024.pub"));
     let sec_path = out_dir.join(format!("{name}.mlkem1024.seed"));
 
-    write_new_file(&pub_path, public_bytes.as_slice(), false)?;
-    write_new_file(&sec_path, seed.as_slice(), true)?;
+    write_key_pair(
+        &pub_path,
+        public_bytes.as_slice(),
+        &sec_path,
+        seed.as_slice(),
+    )?;
 
     println!("Created ML-KEM material:");
     println!("  public key : {}", pub_path.display());
@@ -771,7 +798,7 @@ fn keygen_signing(
     if Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name) {
         bail!("signing-key name must be a safe single path component");
     }
-    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    create_key_directory(out_dir)?;
     let id = match signer_key_id {
         Some(value) => parse_signer_key_id(value)?,
         None => random_array::<SIGNER_KEY_ID_LEN>()?,
@@ -791,8 +818,12 @@ fn keygen_signing(
 
     let public_path = out_dir.join(format!("{name}.mldsa87.pub"));
     let secret_path = out_dir.join(format!("{name}.mldsa87.seed"));
-    write_new_file(&public_path, &encode_signing_public(&public), false)?;
-    write_new_file(&secret_path, &encode_signing_secret(&secret), true)?;
+    write_key_pair(
+        &public_path,
+        &encode_signing_public(&public),
+        &secret_path,
+        &encode_signing_secret(&secret),
+    )?;
 
     println!("Created ML-DSA-87 provenance material:");
     println!("  public key : {}", public_path.display());
@@ -1060,17 +1091,12 @@ fn encode_inventory(inventory: &RootKeyInventory) -> Result<String> {
 }
 
 fn read_inventory(path: &Path) -> Result<RootKeyInventory> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("reading inventory metadata from {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("inventory must be a regular file");
-    }
-    if metadata.len() > MAX_INVENTORY_LEN {
-        bail!("inventory exceeds the {MAX_INVENTORY_LEN}-byte safety limit");
-    }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading inventory {}", path.display()))?;
-    decode_inventory(&text)
+    let bytes = read_bounded(
+        open_material(path, false, "inventory")?,
+        MAX_INVENTORY_LEN as usize,
+        "inventory",
+    )?;
+    decode_inventory(std::str::from_utf8(&bytes).context("invalid inventory UTF-8")?)
 }
 
 fn decode_inventory(text: &str) -> Result<RootKeyInventory> {
@@ -1145,9 +1171,7 @@ fn replace_inventory(path: &Path, encoded: &str) -> Result<()> {
     if encoded.len() as u64 > MAX_INVENTORY_LEN {
         bail!("inventory exceeds the {MAX_INVENTORY_LEN}-byte safety limit");
     }
-    let pending = TemporaryFile::new(temporary_output_path(path)?);
-    let mut file = create_private_new(&pending.path)
-        .with_context(|| format!("creating temporary inventory {}", pending.path.display()))?;
+    let (pending, mut file) = TemporaryFile::create(path, true)?;
     file.write_all(encoded.as_bytes())?;
     file.sync_all()?;
     drop(file);
@@ -1282,17 +1306,12 @@ fn encode_signer_policy(policy: &SignerPolicy) -> Result<String> {
 }
 
 fn read_signer_policy(path: &Path) -> Result<SignerPolicy> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("reading signer policy metadata from {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("signer policy must be a regular file");
-    }
-    if metadata.len() > MAX_SIGNER_POLICY_LEN {
-        bail!("signer policy exceeds the {MAX_SIGNER_POLICY_LEN}-byte safety limit");
-    }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading signer policy {}", path.display()))?;
-    decode_signer_policy(&text)
+    let bytes = read_bounded(
+        open_material(path, false, "signer policy")?,
+        MAX_SIGNER_POLICY_LEN as usize,
+        "signer policy",
+    )?;
+    decode_signer_policy(std::str::from_utf8(&bytes).context("invalid signer policy UTF-8")?)
 }
 
 fn decode_signer_policy(text: &str) -> Result<SignerPolicy> {
@@ -1338,13 +1357,7 @@ fn replace_signer_policy(path: &Path, encoded: &str) -> Result<()> {
     if encoded.len() as u64 > MAX_SIGNER_POLICY_LEN {
         bail!("signer policy exceeds the {MAX_SIGNER_POLICY_LEN}-byte safety limit");
     }
-    let pending = TemporaryFile::new(temporary_output_path(path)?);
-    let mut file = create_private_new(&pending.path).with_context(|| {
-        format!(
-            "creating temporary signer policy {}",
-            pending.path.display()
-        )
-    })?;
+    let (pending, mut file) = TemporaryFile::create(path, true)?;
     file.write_all(encoded.as_bytes())?;
     file.sync_all()?;
     drop(file);
@@ -1416,6 +1429,7 @@ fn seal(
     let ek = EncapsulationKey::new_from_slice(&public_bytes)
         .map_err(|_| anyhow!("invalid ML-KEM-1024 public key"))?;
     let (kem_ct, shared_secret) = ek.encapsulate();
+    let shared_secret = Zeroizing::new(shared_secret);
 
     let mut hkdf_salt = [0u8; 32];
     let mut data_nonce_prefix = [0u8; 8];
@@ -1430,6 +1444,8 @@ fn seal(
     getrandom::fill(dek.as_mut()).context("generating data encryption key")?;
 
     let kek = root_provider.derive_archive_kek(shared_secret.as_slice(), &hkdf_salt)?;
+    drop(root_provider);
+    drop(shared_secret);
 
     let metadata_aad = encode_metadata_aad(
         chunk_size,
@@ -1478,6 +1494,9 @@ fn seal(
             },
         )
         .map_err(|_| anyhow!("failed to wrap data encryption key"))?;
+    drop(metadata_cipher);
+    drop(wrap_cipher);
+    drop(kek);
 
     let header = Header {
         chunk_size,
@@ -1496,27 +1515,24 @@ fn seal(
     let header_bytes = encode_header(&header)?;
     let header_hash = Sha384::digest(&header_bytes);
 
-    let mut reader =
-        BufReader::new(File::open(input).with_context(|| format!("opening {}", input.display()))?);
+    let mut reader = File::open(input).with_context(|| format!("opening {}", input.display()))?;
     if out_path.exists() {
         bail!(
             "refusing to overwrite existing output {}",
             out_path.display()
         );
     }
-    let pending = TemporaryFile::new(temporary_output_path(&out_path)?);
-    let mut writer = BufWriter::new(
-        create_private_new(&pending.path)
-            .with_context(|| format!("creating temporary output {}", pending.path.display()))?,
-    );
+    let (pending, file) = TemporaryFile::create(&out_path, true)?;
+    let mut writer = BufWriter::new(file);
 
     writer.write_all(&(header_bytes.len() as u32).to_be_bytes())?;
     writer.write_all(&header_bytes)?;
 
     let data_cipher =
         Aes256Gcm::new_from_slice(dek.as_ref()).map_err(|_| anyhow!("invalid DEK length"))?;
+    drop(dek);
 
-    let mut buf = vec![0u8; chunk_size as usize];
+    let mut buf = Zeroizing::new(vec![0u8; chunk_size as usize]);
     let mut index: u32 = 0;
     let mut total: u64 = 0;
 
@@ -1606,13 +1622,10 @@ fn sign_archive(input: &Path, output: Option<&Path>, signing_key_path: &Path) ->
         );
     }
 
-    let pending = TemporaryFile::new(temporary_output_path(&out_path)?);
+    let (pending, file) = TemporaryFile::create(&out_path, true)?;
     let mut source =
         BufReader::new(File::open(input).with_context(|| format!("opening {}", input.display()))?);
-    let mut destination = BufWriter::new(
-        create_private_new(&pending.path)
-            .with_context(|| format!("creating temporary output {}", pending.path.display()))?,
-    );
+    let mut destination = BufWriter::new(file);
     let copied = std::io::copy(&mut source, &mut destination)?;
     destination.flush()?;
     destination.get_ref().sync_all()?;
@@ -1907,10 +1920,7 @@ fn open_archive_with_policy(
     let temp_anchor = requested_output
         .as_deref()
         .unwrap_or_else(|| Path::new("pqbackup-restore"));
-    let pending = TemporaryFile::new(temporary_output_path(temp_anchor)?);
-    let file = create_private_new(&pending.path)
-        .with_context(|| format!("creating temporary output {}", pending.path.display()))?;
-    let mut writer = BufWriter::new(file);
+    let (pending, mut writer) = TemporaryFile::create(temp_anchor, true)?;
 
     let (decrypted, verified) = decrypt_with_policy(
         input,
@@ -1920,7 +1930,8 @@ fn open_archive_with_policy(
         provenance,
     )?;
     let provenance_present = decrypted.provenance.is_some();
-    let out_path = requested_output.unwrap_or_else(|| PathBuf::from(decrypted.original_name));
+    let out_path =
+        requested_output.unwrap_or_else(|| PathBuf::from(decrypted.original_name.as_str()));
     if out_path.exists() {
         bail!(
             "refusing to overwrite existing output {}",
@@ -1929,7 +1940,7 @@ fn open_archive_with_policy(
     }
 
     writer.flush()?;
-    writer.get_ref().sync_all()?;
+    writer.sync_all()?;
     drop(writer);
     pending.commit(&out_path)?;
 
@@ -2068,8 +2079,14 @@ fn decrypt_archive_reader<R: Read, W: Write>(
     let shared_secret = dk
         .decapsulate_slice(&header.kem_ciphertext)
         .map_err(|_| anyhow!("invalid ML-KEM ciphertext"))?;
+    let shared_secret = Zeroizing::new(shared_secret);
 
     let kek = root_provider.derive_archive_kek(shared_secret.as_slice(), &header.hkdf_salt)?;
+    drop(root_provider);
+    drop(shared_secret);
+    drop(dk);
+    drop(seed);
+    drop(seed_vec);
 
     let metadata_aad = encode_metadata_aad(
         header.chunk_size,
@@ -2099,8 +2116,11 @@ fn decrypt_archive_reader<R: Read, W: Write>(
                 )
             })?,
     );
-    let original_name =
-        String::from_utf8(original_name_bytes.to_vec()).context("invalid encrypted filename")?;
+    let original_name = Zeroizing::new(
+        std::str::from_utf8(&original_name_bytes)
+            .context("invalid encrypted filename")?
+            .to_owned(),
+    );
     validate_filename(&original_name)?;
 
     let wrap_aad = encode_wrap_aad(
@@ -2140,6 +2160,12 @@ fn decrypt_archive_reader<R: Read, W: Write>(
 
     let cipher =
         Aes256Gcm::new_from_slice(dek.as_ref()).map_err(|_| anyhow!("invalid DEK length"))?;
+    drop(dek);
+    drop(dek_vec);
+    drop(kek);
+    drop(wrap_cipher);
+    drop(metadata_cipher);
+    drop(original_name_bytes);
 
     let mut expected_index: u32 = 0;
     let mut total: u64 = 0;
@@ -2440,18 +2466,22 @@ fn print_provenance_metadata(provenance: Option<&ProvenanceTrailer>) {
     }
 }
 
-fn derive_kek(shared: &[u8], root: &[u8; ROOT_SECRET_LEN], salt: &[u8; 32]) -> Result<[u8; 32]> {
+fn derive_kek(
+    shared: &[u8],
+    root: &[u8; ROOT_SECRET_LEN],
+    salt: &[u8; 32],
+) -> Result<Zeroizing<[u8; 32]>> {
     // Fixed-length composition: 32-byte ML-KEM shared secret || 32-byte independent root secret.
-    let mut ikm = [0u8; 64];
+    let mut ikm = Zeroizing::new([0u8; 64]);
     if shared.len() != 32 {
         bail!("unexpected ML-KEM shared secret length");
     }
     ikm[..32].copy_from_slice(shared);
     ikm[32..].copy_from_slice(root);
 
-    let hk = Hkdf::<Sha384>::new(Some(salt), &ikm);
-    let mut kek = [0u8; 32];
-    hk.expand(b"pqbackup/v2/archive-kek/aes-256-gcm", &mut kek)
+    let hk = Hkdf::<Sha384>::new(Some(salt), ikm.as_ref());
+    let mut kek = Zeroizing::new([0u8; 32]);
+    hk.expand(b"pqbackup/v2/archive-kek/aes-256-gcm", kek.as_mut())
         .map_err(|_| anyhow!("HKDF expansion failed"))?;
     ikm.zeroize();
     Ok(kek)
@@ -2778,27 +2808,197 @@ fn create_private_new(path: &Path) -> Result<File> {
     options.open(path).map_err(Into::into)
 }
 
-fn write_new_file(path: &Path, data: &[u8], secret: bool) -> Result<()> {
-    let mut f = if secret {
-        create_private_new(path)?
-    } else {
-        create_new(path)?
-    };
-    f.write_all(data)?;
-    f.sync_all()?;
+fn sync_parent(path: &Path) -> Result<()> {
+    io_checkpoint("directory.sync")?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?
+        .sync_all()
+        .with_context(|| format!("synchronizing directory {}", parent.display()))
+}
+
+// Fault injection is confined to the unit-test binary and current test thread.
+#[cfg(test)]
+thread_local! {
+    static IO_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+fn io_checkpoint(_stage: &'static str) -> std::io::Result<()> {
+    #[cfg(test)]
+    if IO_FAILURE.with(|failure| {
+        if failure.get() == Some(_stage) {
+            failure.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(std::io::Error::other(format!("injected {_stage} failure")));
+    }
     Ok(())
 }
 
-fn read_exact_sized(path: &Path, expected: usize, label: &str) -> Result<Vec<u8>> {
-    let data =
-        fs::read(path).with_context(|| format!("reading {label} from {}", path.display()))?;
-    if data.len() != expected {
+fn stage_file(path: &Path, data: &[u8], secret: bool) -> Result<TemporaryFile> {
+    stage_file_with(path, secret, |file| {
+        io_checkpoint("stage.write")?;
+        file.write_all(data)?;
+        Ok(())
+    })
+}
+
+fn stage_file_with(
+    path: &Path,
+    secret: bool,
+    write: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<TemporaryFile> {
+    let (pending, mut file) = TemporaryFile::create(path, secret)?;
+    write(&mut file)?;
+    io_checkpoint("stage.flush")?;
+    file.flush()?;
+    io_checkpoint("stage.sync")?;
+    file.sync_all()?;
+    drop(file);
+    Ok(pending)
+}
+
+fn create_key_directory(path: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.as_os_str().is_empty() {
+        match fs::metadata(current) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => bail!(
+                "key directory path is not a directory: {}",
+                current.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(current),
+            Err(error) => return Err(error.into()),
+        }
+        current = current.parent().unwrap_or_else(|| Path::new("."));
+    }
+    for directory in missing.into_iter().rev() {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(directory)
+            .with_context(|| format!("creating key directory {}", directory.display()))?;
+        sync_parent(directory)?;
+    }
+    Ok(())
+}
+
+fn write_new_file(path: &Path, data: &[u8], secret: bool) -> Result<()> {
+    stage_file(path, data, secret)?.commit(path)
+}
+
+fn write_key_pair(
+    public_path: &Path,
+    public: &[u8],
+    secret_path: &Path,
+    secret: &[u8],
+) -> Result<()> {
+    for path in [public_path, secret_path] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => bail!("refusing to overwrite existing key {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let public_pending = stage_file(public_path, public, false)?;
+    let secret_pending = stage_file(secret_path, secret, true)?;
+    // There is no portable atomic two-file publication. Preserve the secret if
+    // the second publication fails; never remove a published recovery secret.
+    secret_pending.commit(secret_path).with_context(|| {
+        format!(
+            "key-pair generation did not complete; inspect {} before retrying",
+            secret_path.display()
+        )
+    })?;
+    (|| -> Result<()> {
+        io_checkpoint("pair.public")?;
+        public_pending.commit(public_path)
+    })().with_context(|| format!(
+        "key-pair generation incomplete: secret retained at {}; inspect public output {} before retrying", secret_path.display(), public_path.display()
+    ))
+}
+
+fn open_material(path: &Path, secret: bool, label: &str) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // NONBLOCK prevents a FIFO from hanging before descriptor validation.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).with_context(|| {
+        format!(
+            "opening {label} {}; use a regular file and an explicit non-symlink filename",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        bail!("{label} must be a regular file");
+    }
+    #[cfg(unix)]
+    if secret {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid takes no arguments and has no memory-safety preconditions.
+        validate_secret_permissions(metadata.uid(), metadata.mode(), unsafe { libc::geteuid() })
+            .with_context(|| format!("unsafe permissions on {label} {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    if secret {
+        bail!("strict secret-file access requires a supported Unix platform");
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn validate_secret_permissions(owner: u32, mode: u32, current_user: u32) -> Result<()> {
+    if owner != current_user {
+        bail!("secret must be owned by the current effective user");
+    }
+    if mode & 0o077 != 0 {
         bail!(
-            "{label} must be exactly {expected} bytes; got {}",
-            data.len()
+            "secret grants group/other permissions; restrict it to mode 0600 or 0400 after checking custody and ACLs"
         );
     }
+    Ok(())
+}
+
+fn read_bounded<R: Read>(reader: R, maximum: usize, label: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let limit = maximum
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("read limit overflow"))?;
+    // Fixed capacity prevents secret-bearing reallocations while reading.
+    let mut data = Zeroizing::new(vec![0u8; limit]);
+    let mut reader = reader.take(limit as u64);
+    let mut used = 0;
+    while used < limit {
+        match reader.read(&mut data[used..]) {
+            Ok(0) => break,
+            Ok(n) => used += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).with_context(|| format!("reading {label}")),
+        }
+    }
+    if used > maximum {
+        bail!("{label} exceeds the {maximum}-byte safety limit");
+    }
+    data.truncate(used);
     Ok(data)
+}
+
+fn read_exact_sized(path: &Path, expected: usize, label: &str) -> Result<Zeroizing<Vec<u8>>> {
+    read_material(path, expected, label, false)
 }
 
 fn read_exact_sized_secret(
@@ -2806,9 +3006,16 @@ fn read_exact_sized_secret(
     expected: usize,
     label: &str,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let data = Zeroizing::new(
-        fs::read(path).with_context(|| format!("reading {label} from {}", path.display()))?,
-    );
+    read_material(path, expected, label, true)
+}
+
+fn read_material(
+    path: &Path,
+    expected: usize,
+    label: &str,
+    secret: bool,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let data = read_bounded(open_material(path, secret, label)?, expected, label)?;
     if data.len() != expected {
         bail!(
             "{label} must be exactly {expected} bytes; got {}",
@@ -2818,8 +3025,10 @@ fn read_exact_sized_secret(
     Ok(data)
 }
 
-fn encode_root_key(root: &RootKey) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + 2 + ROOT_KEY_ID_LEN + 4 + ROOT_SECRET_LEN);
+fn encode_root_key(root: &RootKey) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(
+        8 + 2 + ROOT_KEY_ID_LEN + 4 + ROOT_SECRET_LEN,
+    ));
     out.extend_from_slice(ROOT_MAGIC);
     out.extend_from_slice(&ROOT_VERSION.to_be_bytes());
     out.extend_from_slice(&root.id);
@@ -2843,10 +3052,11 @@ struct FileRootSecretProvider {
 
 impl FileRootSecretProvider {
     fn open(path: &Path) -> Result<Self> {
-        let data = Zeroizing::new(
-            fs::read(path)
-                .with_context(|| format!("reading root secret from {}", path.display()))?,
-        );
+        let data = read_exact_sized_secret(
+            path,
+            8 + 2 + ROOT_KEY_ID_LEN + 4 + ROOT_SECRET_LEN,
+            "root key",
+        )?;
         Ok(Self {
             root: decode_root_key(&data)?,
         })
@@ -2866,11 +3076,7 @@ impl RootSecretProvider for FileRootSecretProvider {
         shared_secret: &[u8],
         salt: &[u8; 32],
     ) -> Result<Zeroizing<[u8; 32]>> {
-        Ok(Zeroizing::new(derive_kek(
-            shared_secret,
-            &self.root.secret,
-            salt,
-        )?))
+        derive_kek(shared_secret, &self.root.secret, salt)
     }
 }
 
@@ -2880,10 +3086,7 @@ fn file_root_secret_provider(path: &Path) -> Result<Box<dyn RootSecretProvider>>
 
 #[cfg(test)]
 fn read_root_key(path: &Path) -> Result<RootKey> {
-    let data = Zeroizing::new(
-        fs::read(path).with_context(|| format!("reading root secret from {}", path.display()))?,
-    );
-    decode_root_key(&data)
+    Ok(FileRootSecretProvider::open(path)?.root)
 }
 
 fn decode_root_key(data: &[u8]) -> Result<RootKey> {
@@ -2910,8 +3113,10 @@ fn decode_root_key(data: &[u8]) -> Result<RootKey> {
     Ok(RootKey { id, epoch, secret })
 }
 
-fn encode_signing_secret(secret: &SigningSecret) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + 2 + 2 + SIGNER_KEY_ID_LEN + 4 + MLDSA_SEED_LEN);
+fn encode_signing_secret(secret: &SigningSecret) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(
+        8 + 2 + 2 + SIGNER_KEY_ID_LEN + 4 + MLDSA_SEED_LEN,
+    ));
     out.extend_from_slice(SIGNING_SECRET_MAGIC);
     out.extend_from_slice(&SIGNING_KEY_VERSION.to_be_bytes());
     out.extend_from_slice(&SIGNATURE_ALG_MLDSA87.to_be_bytes());
@@ -3218,7 +3423,7 @@ mod tests {
             kem_ct.as_slice(),
         )
         .unwrap();
-        let cipher = Aes256Gcm::new_from_slice(&kek).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(kek.as_ref()).unwrap();
         let metadata_ciphertext = cipher
             .encrypt(
                 &aes_nonce(&metadata_nonce),
@@ -3475,7 +3680,7 @@ mod tests {
         };
         let bytes = encode_root_key(&root);
         assert_eq!(
-            bytes,
+            *bytes,
             fixture_hex(include_str!("../test-vectors/root-key.hex"))
         );
         assert_eq!(&bytes[..8], ROOT_MAGIC);
@@ -3505,7 +3710,7 @@ mod tests {
         assert_eq!(metadata.epoch, 12);
         assert_eq!(
             *provider.derive_archive_kek(&shared, &salt).unwrap(),
-            expected
+            *expected
         );
     }
 
@@ -3945,6 +4150,207 @@ unexpected = "field"
         Ok(())
     }
 
+    #[test]
+    fn bounded_reads_stop_at_limit_and_reject_truncation() -> Result<()> {
+        let mut source = std::io::repeat(0x42);
+        assert!(read_bounded(&mut source, 62, "test").is_err());
+        struct CountRead {
+            count: usize,
+        }
+        impl Read for CountRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(0x42);
+                self.count += buf.len();
+                Ok(buf.len())
+            }
+        }
+        let mut counted = CountRead { count: 0 };
+        assert!(read_bounded(&mut counted, 64, "seed").is_err());
+        assert_eq!(counted.count, 65);
+        assert!(read_bounded(std::io::empty(), usize::MAX, "overflow").is_err());
+        let dir = TestDir::new()?;
+        let path = dir.0.join("key");
+        write_new_file(&path, b"short", true)?;
+        assert!(read_exact_sized_secret(&path, 64, "seed").is_err());
+        fs::write(&path, [0u8; 65])?;
+        assert!(read_exact_sized_secret(&path, 64, "seed").is_err());
+        fs::write(&path, [0u8; 64])?;
+        assert_eq!(read_exact_sized_secret(&path, 64, "seed")?.len(), 64);
+        // The size cap applies to the stream even if a pre-read metadata length is stale.
+        let opened = open_material(&path, true, "seed")?;
+        fs::write(&path, [0u8; 65])?;
+        assert!(read_bounded(opened, 64, "seed").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn material_reads_enforce_file_type_symlinks_and_secret_permissions() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = TestDir::new()?;
+        let path = dir.0.join("seed");
+        write_new_file(&path, &[0u8; 64], true)?;
+        for mode in [0o600, 0o400] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+            read_exact_sized_secret(&path, 64, "seed")?;
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        assert!(read_exact_sized_secret(&path, 64, "seed").is_err());
+        read_exact_sized(&path, 64, "public material")?;
+        assert!(validate_secret_permissions(1000, 0o600, 1001).is_err());
+        assert!(validate_secret_permissions(1000, 0o640, 1000).is_err());
+        assert!(read_exact_sized(&dir.0, 64, "directory").is_err());
+        let link = dir.0.join("link");
+        symlink(&path, &link)?;
+        assert!(read_exact_sized(&link, 64, "symlink").is_err());
+        assert!(read_inventory(&link).is_err());
+        assert!(read_signer_policy(&link).is_err());
+        let fifo = dir.0.join("fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())?;
+        // SAFETY: the C string is NUL-terminated and valid for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert!(open_material(&fifo, true, "FIFO").is_err());
+        assert!(open_material(Path::new("/dev/null"), false, "device").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_write_failures_remove_only_owned_files() -> Result<()> {
+        let dir = TestDir::new()?;
+        let output = dir.0.join("key");
+        for stage in ["stage.write", "stage.flush", "stage.sync", "publish.link"] {
+            IO_FAILURE.with(|failure| failure.set(Some(stage)));
+            assert!(write_new_file(&output, b"secret", true).is_err(), "{stage}");
+            assert!(!output.exists());
+            assert_eq!(fs::read_dir(&dir.0)?.count(), 0, "{stage}");
+        }
+        assert!(
+            stage_file_with(&output, true, |file| {
+                file.write_all(b"partially written secret")?;
+                bail!("simulated disk-full after partial write")
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read_dir(&dir.0)?.count(), 0);
+        write_new_file(&output, b"existing", true)?;
+        assert!(write_new_file(&output, b"replacement", true).is_err());
+        assert_eq!(fs::read(&output)?, b"existing");
+        assert_eq!(fs::read_dir(&dir.0)?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn publication_errors_report_already_visible_output() -> Result<()> {
+        for stage in ["directory.sync", "publish.unlink"] {
+            let dir = TestDir::new()?;
+            let output = dir.0.join("output");
+            let pending = stage_file(&output, b"complete", true)?;
+            IO_FAILURE.with(|failure| failure.set(Some(stage)));
+            let error = pending.commit(&output).unwrap_err();
+            assert!(error.to_string().contains("was published"));
+            assert_eq!(fs::read(&output)?, b"complete");
+            assert_eq!(fs::read_dir(&dir.0)?.count(), 1);
+        }
+        let dir = TestDir::new()?;
+        let output = dir.0.join("policy");
+        write_new_file(&output, b"original", true)?;
+        let pending = stage_file(&output, b"updated", true)?;
+        IO_FAILURE.with(|failure| failure.set(Some("publish.rename")));
+        assert!(pending.replace(&output).is_err());
+        assert_eq!(fs::read(&output)?, b"original");
+        let pending = stage_file(&output, b"updated", true)?;
+        IO_FAILURE.with(|failure| failure.set(Some("directory.sync")));
+        let error = pending.replace(&output).unwrap_err();
+        assert!(error.to_string().contains("was replaced"));
+        assert_eq!(fs::read(&output)?, b"updated");
+        Ok(())
+    }
+
+    #[test]
+    fn key_pair_failure_preserves_complete_secret_and_existing_files() -> Result<()> {
+        let dir = TestDir::new()?;
+        let public = dir.0.join("public");
+        let secret = dir.0.join("secret");
+        IO_FAILURE.with(|failure| failure.set(Some("pair.public")));
+        let error = write_key_pair(&public, b"public", &secret, b"secret").unwrap_err();
+        assert!(error.to_string().contains("secret retained"));
+        assert_eq!(fs::read(&secret)?, b"secret");
+        assert!(!public.exists());
+        assert_eq!(fs::read_dir(&dir.0)?.count(), 1);
+        assert!(write_key_pair(&public, b"public", &secret, b"new").is_err());
+        assert!(!public.exists());
+        assert_eq!(fs::read(&secret)?, b"secret");
+        assert!(keygen_kem(&dir.0, "../escaped").is_err());
+        assert!(keygen_signing(&dir.0, "../escaped", None, 0).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_key_directories_are_private_and_existing_permissions_are_preserved() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new()?;
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o750))?;
+        let nested = dir.0.join("new/nested");
+        keygen_kem(&nested, "archive")?;
+        for path in [dir.0.join("new"), nested.clone()] {
+            assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o700);
+        }
+        assert_eq!(fs::metadata(&dir.0)?.permissions().mode() & 0o777, 0o750);
+        read_exact_sized_secret(
+            &nested.join("archive.mlkem1024.seed"),
+            MLKEM_SEED_LEN,
+            "seed",
+        )?;
+        read_exact_sized(
+            &nested.join("archive.mlkem1024.pub"),
+            MLKEM1024_PK_LEN,
+            "public",
+        )?;
+        assert!(create_key_directory(&nested.join("archive.mlkem1024.pub/child")).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_private_temporary_file_requires_explicit_cleanup() -> Result<()> {
+        use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+        const CHILD_PATH: &str = "PQBACKUP_TEST_INTERRUPTED_OUTPUT";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let (_pending, mut file) = TemporaryFile::create(Path::new(&path), true)?;
+            file.write_all(b"authenticated prefix; archive not yet complete")?;
+            file.sync_all()?;
+            // SAFETY: terminate only this deliberately spawned unit-test process.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+            unreachable!("SIGKILL should terminate the child");
+        }
+        let dir = TestDir::new()?;
+        let output = dir.0.join("restore");
+        let child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::interrupted_private_temporary_file_requires_explicit_cleanup",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, &output)
+            .output()?;
+        assert_eq!(child.status.signal(), Some(libc::SIGKILL));
+        assert!(!output.exists());
+        let entries = fs::read_dir(&dir.0)?.collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(entries.len(), 1);
+        let leftover = entries[0].path();
+        assert_eq!(fs::metadata(&leftover)?.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::read(&leftover)?,
+            b"authenticated prefix; archive not yet complete"
+        );
+        fs::remove_file(&leftover)?;
+        sync_parent(&leftover)?;
+        Ok(())
+    }
+
     struct ProvenanceFixture {
         dir: TestDir,
         signed: PathBuf,
@@ -3972,14 +4378,15 @@ unexpected = "field"
             sign_archive(&unsigned, Some(&signed), &signing_secret)?;
             let seed = dir.0.join("seed");
             let root = dir.0.join("root");
-            fs::write(&seed, test_bytes::<MLKEM_SEED_LEN>(0))?;
-            fs::write(
+            write_new_file(&seed, &test_bytes::<MLKEM_SEED_LEN>(0), true)?;
+            write_new_file(
                 &root,
-                encode_root_key(&RootKey {
+                &encode_root_key(&RootKey {
                     id: test_bytes::<16>(0x60),
                     epoch: 0x0102_0304,
                     secret: Zeroizing::new(test_bytes::<32>(0x70)),
                 }),
+                true,
             )?;
             Ok(Self {
                 dir,
@@ -4277,14 +4684,15 @@ unexpected = "field"
 
         let recovery_seed = dir.0.join("vector.mlkem1024.seed");
         let recovery_root = dir.0.join("vector.root.key");
-        fs::write(&recovery_seed, test_bytes::<MLKEM_SEED_LEN>(0x00))?;
-        fs::write(
+        write_new_file(&recovery_seed, &test_bytes::<MLKEM_SEED_LEN>(0x00), true)?;
+        write_new_file(
             &recovery_root,
-            encode_root_key(&RootKey {
+            &encode_root_key(&RootKey {
                 id: test_bytes::<ROOT_KEY_ID_LEN>(0x60),
                 epoch: 0x0102_0304,
                 secret: Zeroizing::new(test_bytes::<ROOT_SECRET_LEN>(0x70)),
             }),
+            true,
         )?;
         verify_archive(&signed, &recovery_seed, &recovery_root)?;
 
@@ -4555,13 +4963,13 @@ public_sha256 = "111111111111111111111111111111111111111111111111111111111111111
         let seed_path = dir.0.join("seed");
         let root_path = dir.0.join("root");
         fs::write(&archive, vector.archive)?;
-        fs::write(&seed_path, test_bytes::<MLKEM_SEED_LEN>(0x00))?;
+        write_new_file(&seed_path, &test_bytes::<MLKEM_SEED_LEN>(0x00), true)?;
         let root = RootKey {
             id: test_bytes::<ROOT_KEY_ID_LEN>(0x60),
             epoch: 0x0102_0304,
             secret: Zeroizing::new(test_bytes::<ROOT_SECRET_LEN>(0x70)),
         };
-        fs::write(&root_path, encode_root_key(&root))?;
+        write_new_file(&root_path, &encode_root_key(&root), true)?;
         assert!(decrypt_archive_to(&archive, &seed_path, &root_path, &mut FailingWriter).is_err());
         Ok(())
     }

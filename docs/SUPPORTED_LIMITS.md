@@ -13,7 +13,13 @@ The security-supported development scope is:
 
 Windows, network filesystems, cloud-synchronized folders, FUSE filesystems, object-store mounts, unusual removable-media filesystems, containers with weak entropy, and 32-bit targets are not security-supported yet. They may work, but file permissions, atomic publication, durability, and failure behavior have not been validated.
 
-The current Unix implementation creates new secret and inventory files with mode `0600` atomically. It does not validate directory permissions or defend against a compromised parent directory.
+Version 0.1.3 creates secret and inventory files with mode `0600` and new key
+directories with mode `0700`. Secret reads require current-effective-user ownership
+and no group/other mode bits. Key, inventory, and policy reads reject non-regular
+files and final-component symlinks and enforce bounded reads on the opened file.
+Extended ACLs and the entire parent-directory chain remain operator-controlled
+trust requirements; the application does not defend against compromised parents.
+See [secret handling](./SECRET_HANDLING.md) for migration and limitations.
 
 ## Current enforced format limits
 
@@ -78,6 +84,10 @@ The recovery kit supplies vendored dependencies for locked offline builds.
 
 ## Filesystem requirements
 
-Recovery's no-replace publication is only assumed atomic when the temporary file and output are in the same directory on a conforming local filesystem with hard-link support. Durability across power loss is not claimed for every filesystem. Verify restored output and application-level contents after recovery.
+Recovery's no-replace publication is only assumed atomic when the temporary file and output are in the same directory on a conforming local filesystem with hard-link support. Version 0.1.3 requests parent-directory synchronization after publication,
+replacement, and successful cleanup. Post-publication failures explicitly report
+that output may already exist. Durability across power loss is not claimed for
+every filesystem or device. Verify restored output and application-level contents
+after recovery.
 
 Secure deletion is not provided. Removing plaintext from SSDs, snapshots, backups, swap, or copy-on-write filesystems is outside the package boundary.
