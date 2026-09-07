@@ -453,9 +453,24 @@ The restore is written to a same-directory temporary file and atomically
 published without overwriting an existing name only after every chunk
 authenticates. A failed restore leaves no completed output file.
 
-`open` authenticates encryption but does not make a signer-trust decision. If a
-provenance trailer is present, it is structurally validated and the command
-prints a reminder to run `provenance-verify` separately.
+By default, `open` authenticates encryption and only structurally validates any
+provenance trailer. To require an approved signer before publishing plaintext:
+
+```bash
+pqbackup open backup.signed.pqbk --output restored.tgz \
+  --secret-key /Volumes/PQKEY/home-archive.mlkem1024.seed \
+  --root-secret /Volumes/ROOTKEY/home-archive.root.key \
+  --require-provenance \
+  --signer-public-key archive-signer.mldsa87.pub \
+  --signer-policy signer-policy.toml
+```
+
+All three provenance arguments must be supplied together. The command verifies
+content and signature from the same byte stream and publishes plaintext only
+after both checks and signer policy succeed. Missing or stripped signatures fail.
+Use `--allow-retired` only for explicitly approved historical signers; revoked
+signers always fail. Without `--require-provenance`, unsigned recovery remains
+supported and present signatures are reported as unverified.
 
 ## Verify without writing plaintext
 
@@ -470,8 +485,12 @@ pqbackup verify /Volumes/BACKUPS/home-2026-09-05.pqbk \
 
 Verification requires both recovery secrets because it decrypts and
 authenticates every payload chunk, but it does not create a plaintext file.
-This `verify` command checks encrypted-content integrity, not creator identity;
-use `provenance-verify` for the separate signer-policy decision.
+Add the same `--require-provenance`, `--signer-public-key`, and `--signer-policy`
+arguments shown above to require creator identity as well as content integrity.
+`provenance-verify` remains available for signature-only verification without
+recovery keys. Its reported SHA-256 and byte length identify exactly the bytes
+consumed by verification, including the trailer; they do not guarantee the
+storage path remains unchanged after verification.
 
 ## Suggested backup workflow
 
@@ -571,8 +590,9 @@ Before relying on an archive:
 2. Keep at least two controlled copies of each recovery secret in separate
    locations.
 3. Run `verify` on the completed archive and again after copying it elsewhere.
-4. If provenance matters, run `provenance-verify` using a protected trust
-   policy and retain historical signer public keys and policy snapshots.
+4. If provenance matters, use `--require-provenance` with `verify` and `open`,
+   supply a protected signer public key and policy, and retain historical trust
+   material. Use `provenance-verify` for signature-only checks.
 5. Retain this source code, `Cargo.lock`, a known-good binary, test archive,
    and restore instructions with the recovery materials.
 6. Practice a complete restore periodically on a separate machine or directory.

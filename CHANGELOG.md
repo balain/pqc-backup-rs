@@ -4,6 +4,16 @@ All notable security-relevant and user-visible changes are recorded here.
 
 ## Unreleased
 
+## 0.1.2 - 2026-09-07
+
+### Security hardening plan — Phase 1
+
+- Bound provenance parsing, signature verification, and the reported SHA-256/byte length to one consumed archive stream, eliminating separate path reads for verification and reporting.
+- Added `--require-provenance`, `--signer-public-key`, and `--signer-policy` to `open` and `verify`; required restore publishes plaintext only after content authentication and trusted signer verification both succeed.
+- Reject incomplete policy arguments and missing, stripped, invalid, untrusted, and revoked signatures in required mode; historical retired signers require explicit `--allow-retired`.
+- Added deterministic path-replacement/in-place-mutation tests and required-policy failure/cleanup coverage.
+- Preserved default unsigned recovery and all frozen archive, signature, and KDF encodings.
+
 ## 0.0.6 - 2026-09-06
 
 ### Phase 6 review candidate and controlled pilot

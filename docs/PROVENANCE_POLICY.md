@@ -11,13 +11,52 @@ provided and checked:
 - the ML-DSA-87 public key;
 - a trusted `PQSIGNERS01` policy;
 - an authenticated distribution path for both files; and
-- the `provenance-verify` result.
+- successful `provenance-verify` or signature-required `open`/`verify`.
 
 Do not trust a signer ID printed by `inspect`. The policy, not the archive,
 maps a cryptographic key to a human, service, organization, or release role.
 An attacker who can replace both the public key and policy can name any
 identity, so protect policy distribution and changes at least as strongly as
 the archive provenance decision requires.
+
+## Enforcing provenance during recovery (0.1.2)
+
+`open` and `verify` accept the following arguments together:
+
+```text
+--require-provenance --signer-public-key PATH --signer-policy PATH
+```
+
+Optional `--allow-retired` applies only with this explicit policy. Incomplete
+arguments, or signer arguments without `--require-provenance`, are rejected.
+Absent, stripped, malformed, invalid, untrusted, and revoked signatures fail;
+retired signatures require explicit historical acceptance.
+
+In required mode, one stream supplies parsing, content authentication, signature
+hashing, and the whole-archive SHA-256. Plaintext remains in a private temporary
+file until content authentication and signer-policy verification both pass.
+`verify` discards plaintext instead of creating a file. Normal failure removes
+the temporary output; existing crash/remnant limitations still apply.
+
+Standalone `provenance-verify` uses the same streaming verification path but
+checks structural integrity and the signature, not AEAD content authentication.
+A valid signature over damaged encrypted contents is insufficient for required
+restore. Default `open`/`verify` behavior remains compatible with unsigned archives.
+Removing an optional trailer still produces an unsigned envelope, but cannot
+satisfy the required policy.
+
+The reported archive hash and length refer to exactly the consumed bytes,
+including the accepted trailer. Concurrent path replacement cannot redirect a
+later verification or hashing pass because those passes no longer reopen the
+path. In-place edits to consumed data are authenticated as part of the stream;
+after-read changes to storage do not retroactively alter the result. Verification
+does not lock storage or promise its future contents. Restore with the combined
+mode rather than treating an earlier standalone check as approval for a later
+read of a mutable path.
+
+The archive encoding, ML-DSA message/context, domains, and key derivation are
+unchanged. Memory remains bounded by existing header and chunk limits; no
+whole-archive memory buffer or extra disk snapshot is needed.
 
 ## Recommended roles and custody
 

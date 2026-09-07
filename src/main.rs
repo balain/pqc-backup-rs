@@ -3,7 +3,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
 };
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use hkdf::Hkdf;
 use ml_dsa::{
     EncodedVerifyingKey, Keypair, MlDsa87, Seed as MlDsaSeed, Signature as MlDsaSignature,
@@ -68,6 +68,51 @@ struct DecryptedArchive {
     header: Header,
     original_name: String,
     provenance: Option<ProvenanceTrailer>,
+}
+
+/// Observes only bytes consumed by the parser, not BufReader read-ahead.
+/// Signature hashing stops at the envelope boundary; SHA-256 includes the trailer.
+struct ArchiveReader<'a, R> {
+    inner: R,
+    signature_digest: Option<&'a mut dyn Update>,
+    archive_digest: Sha256,
+    archive_len: u64,
+}
+
+impl<'a, R: Read> ArchiveReader<'a, R> {
+    fn new(inner: R, signature_digest: Option<&'a mut dyn Update>) -> Self {
+        Self {
+            inner,
+            signature_digest,
+            archive_digest: Sha256::new(),
+            archive_len: 0,
+        }
+    }
+
+    fn finish_envelope(&mut self) {
+        self.signature_digest = None;
+    }
+}
+
+impl<R: Read> Read for ArchiveReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if let Some(digest) = &mut self.signature_digest {
+            digest.update(&buf[..n]);
+        }
+        Digest::update(&mut self.archive_digest, &buf[..n]);
+        self.archive_len += n as u64;
+        Ok(n)
+    }
+}
+
+struct VerifiedProvenance {
+    archive_sha256: String,
+    archive_len: u64,
+    signer_id: String,
+    signer_epoch: u32,
+    identity: String,
+    status: SignerStatus,
 }
 
 struct TemporaryFile {
@@ -135,6 +180,20 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Args, Default)]
+struct ProvenanceOptions {
+    /// Require trusted provenance as well as authenticated content.
+    #[arg(long, requires_all = ["signer_public_key", "signer_policy"])]
+    require_provenance: bool,
+    #[arg(long, requires = "require_provenance")]
+    signer_public_key: Option<PathBuf>,
+    #[arg(long, requires = "require_provenance")]
+    signer_policy: Option<PathBuf>,
+    /// Permit retired signers only under explicit historical policy; never revoked signers.
+    #[arg(long, requires = "require_provenance")]
+    allow_retired: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Create only the ML-KEM-1024 public key and decapsulation seed.
@@ -199,6 +258,8 @@ enum Command {
         secret_key: PathBuf,
         #[arg(long)]
         root_secret: PathBuf,
+        #[command(flatten)]
+        provenance: ProvenanceOptions,
     },
 
     /// Cryptographically verify the full archive without writing plaintext.
@@ -208,6 +269,8 @@ enum Command {
         secret_key: PathBuf,
         #[arg(long)]
         root_secret: PathBuf,
+        #[command(flatten)]
+        provenance: ProvenanceOptions,
     },
 
     /// Display non-secret envelope metadata without decrypting.
@@ -522,12 +585,20 @@ fn main() -> Result<()> {
             output,
             secret_key,
             root_secret,
-        } => open_archive(&input, output.as_deref(), &secret_key, &root_secret),
+            provenance,
+        } => open_archive_with_policy(
+            &input,
+            output.as_deref(),
+            &secret_key,
+            &root_secret,
+            &provenance,
+        ),
         Command::Verify {
             input,
             secret_key,
             root_secret,
-        } => verify_archive(&input, &secret_key, &root_secret),
+            provenance,
+        } => verify_archive_with_policy(&input, &secret_key, &root_secret, &provenance),
         Command::Inspect { input } => inspect(&input),
         Command::Sign {
             input,
@@ -1622,32 +1693,74 @@ fn verify_provenance(
     policy_path: &Path,
     allow_retired: bool,
 ) -> Result<()> {
-    let layout = scan_archive_layout(input)?;
-    let trailer = layout
-        .provenance
-        .as_ref()
-        .ok_or_else(|| anyhow!("archive has no provenance signature"))?;
+    let (_, verified) = verify_provenance_reader(
+        archive_input(input)?,
+        public_key_path,
+        policy_path,
+        allow_retired,
+        |reader| {
+            let layout = scan_archive_reader(reader)?;
+            Ok(((), layout.provenance))
+        },
+    )?;
+    println!("Valid archive provenance: {}", input.display());
+    print_verified_provenance(&verified);
+    Ok(())
+}
+
+/// The callback parses (and optionally decrypts) the same stream being hashed.
+/// compute_mu uses the same empty context as DigestVerifier; no signature format changes.
+fn verify_provenance_reader<R: Read, T>(
+    source: R,
+    public_key_path: &Path,
+    policy_path: &Path,
+    allow_retired: bool,
+    process: impl FnOnce(&mut ArchiveReader<'_, R>) -> Result<(T, Option<ProvenanceTrailer>)>,
+) -> Result<(T, VerifiedProvenance)> {
     let public = read_signing_public(public_key_path)?;
+    let verifying_key = verifying_key_from_public(&public)?;
+    let mut parsed = None;
+    let mu = verifying_key.compute_mu(
+        |digest| {
+            digest.update(PROVENANCE_DOMAIN);
+            let mut reader = ArchiveReader::new(source, Some(digest));
+            let result = process(&mut reader).and_then(|(value, trailer)| {
+                let trailer =
+                    trailer.ok_or_else(|| anyhow!("archive has no provenance signature"))?;
+                if reader.signature_digest.is_some()
+                    || trailer
+                        .signed_len
+                        .checked_add((PROVENANCE_STATEMENT_LEN + MLDSA87_SIGNATURE_LEN) as u64)
+                        != Some(reader.archive_len)
+                {
+                    bail!("provenance trailer does not cover the complete encrypted envelope");
+                }
+                let hash = reader.archive_digest.finalize();
+                Ok((value, trailer, hash, reader.archive_len))
+            });
+            parsed = Some(result);
+            // Release the reader's digest borrow before adding the canonical statement.
+            match parsed.as_ref().unwrap() {
+                Ok((_, trailer, _, _)) => {
+                    digest.update(&trailer.statement);
+                    Ok(())
+                }
+                Err(_) => Err(ml_dsa::signature::Error::new()),
+            }
+        },
+        &[],
+    );
+    let (value, trailer, archive_hash, archive_len) =
+        parsed.ok_or_else(|| anyhow!("provenance parser did not run"))??;
+    let mu = mu.map_err(|_| anyhow!("provenance digest failed"))?;
     if trailer.signer_key_id != public.id || trailer.signer_key_epoch != public.epoch {
-        bail!(
-            "public key identity does not match archive signer {} epoch {}",
-            signer_key_id_hex(&trailer.signer_key_id),
-            trailer.signer_key_epoch
-        );
-    }
-    if trailer.signed_len != layout.envelope_len {
-        bail!("provenance trailer does not cover the complete encrypted envelope");
+        bail!("public key identity does not match archive signer");
     }
     let signature = MlDsaSignature::<MlDsa87>::try_from(trailer.signature.as_slice())
         .map_err(|_| anyhow!("invalid ML-DSA-87 signature encoding"))?;
-    let verifying_key = verifying_key_from_public(&public)?;
-    verifying_key
-        .verify_digest(
-            |digest| feed_provenance_message(digest, input, trailer.signed_len, &trailer.statement),
-            &signature,
-        )
-        .map_err(|_| anyhow!("archive provenance signature is invalid"))?;
-
+    if !verifying_key.verify_mu(&mu, &signature) {
+        bail!("archive provenance signature is invalid");
+    }
     let policy = read_signer_policy(policy_path)?;
     let id = signer_key_id_hex(&public.id);
     let record = policy
@@ -1677,17 +1790,32 @@ fn verify_provenance(
         ),
     }
 
-    let archive_sha256 = sha256_file(input)?;
-    println!("Valid archive provenance: {}", input.display());
-    println!("Signer identity : {}", record.identity);
-    println!("Signer ID       : {id}");
-    println!("Signer epoch    : {}", public.epoch);
-    println!("Policy status   : {}", record.status);
-    println!("Archive SHA-256 : {archive_sha256}");
-    if record.status == SignerStatus::Retired {
+    Ok((
+        value,
+        VerifiedProvenance {
+            archive_sha256: archive_hash
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            archive_len,
+            signer_id: id,
+            signer_epoch: public.epoch,
+            identity: record.identity.clone(),
+            status: record.status,
+        },
+    ))
+}
+
+fn print_verified_provenance(verified: &VerifiedProvenance) {
+    println!("Signer identity : {}", verified.identity);
+    println!("Signer ID       : {}", verified.signer_id);
+    println!("Signer epoch    : {}", verified.signer_epoch);
+    println!("Policy status   : {}", verified.status);
+    println!("Archive SHA-256 : {}", verified.archive_sha256);
+    println!("Archive bytes  : {}", verified.archive_len);
+    if verified.status == SignerStatus::Retired {
         eprintln!("warning: accepted a retired signer under explicit historical policy");
     }
-    Ok(())
 }
 
 fn feed_provenance_message<D: Update>(
@@ -1751,6 +1879,22 @@ fn open_archive(
     secret_key_path: &Path,
     root_secret_path: &Path,
 ) -> Result<()> {
+    open_archive_with_policy(
+        input,
+        output,
+        secret_key_path,
+        root_secret_path,
+        &ProvenanceOptions::default(),
+    )
+}
+
+fn open_archive_with_policy(
+    input: &Path,
+    output: Option<&Path>,
+    secret_key_path: &Path,
+    root_secret_path: &Path,
+    provenance: &ProvenanceOptions,
+) -> Result<()> {
     let requested_output = output.map(PathBuf::from);
     if let Some(path) = &requested_output
         && path.exists()
@@ -1768,7 +1912,13 @@ fn open_archive(
         .with_context(|| format!("creating temporary output {}", pending.path.display()))?;
     let mut writer = BufWriter::new(file);
 
-    let decrypted = decrypt_archive_to(input, secret_key_path, root_secret_path, &mut writer)?;
+    let (decrypted, verified) = decrypt_with_policy(
+        input,
+        secret_key_path,
+        root_secret_path,
+        &mut writer,
+        provenance,
+    )?;
     let provenance_present = decrypted.provenance.is_some();
     let out_path = requested_output.unwrap_or_else(|| PathBuf::from(decrypted.original_name));
     if out_path.exists() {
@@ -1784,7 +1934,9 @@ fn open_archive(
     pending.commit(&out_path)?;
 
     println!("Opened {} -> {}", input.display(), out_path.display());
-    if provenance_present {
+    if let Some(verified) = verified {
+        print_verified_provenance(&verified);
+    } else if provenance_present {
         println!("Provenance trailer: present but not verified by this command");
         println!("Run `pqbackup provenance-verify` with an explicit signer policy.");
     }
@@ -1792,22 +1944,100 @@ fn open_archive(
 }
 
 fn verify_archive(input: &Path, secret_key_path: &Path, root_secret_path: &Path) -> Result<()> {
+    verify_archive_with_policy(
+        input,
+        secret_key_path,
+        root_secret_path,
+        &ProvenanceOptions::default(),
+    )
+}
+
+fn verify_archive_with_policy(
+    input: &Path,
+    secret_key_path: &Path,
+    root_secret_path: &Path,
+    provenance: &ProvenanceOptions,
+) -> Result<()> {
     let mut sink = std::io::sink();
-    let decrypted = decrypt_archive_to(input, secret_key_path, root_secret_path, &mut sink)?;
+    let (decrypted, verified) = decrypt_with_policy(
+        input,
+        secret_key_path,
+        root_secret_path,
+        &mut sink,
+        provenance,
+    )?;
     println!(
         "Verified {}: authenticated {} bytes",
         input.display(),
         decrypted.header.original_len
     );
-    if decrypted.provenance.is_some() {
+    if let Some(verified) = verified {
+        print_verified_provenance(&verified);
+    } else if decrypted.provenance.is_some() {
         println!("Provenance trailer: present but not verified by this command");
         println!("Run `pqbackup provenance-verify` with an explicit signer policy.");
     }
     Ok(())
 }
 
+fn decrypt_with_policy<W: Write>(
+    input: &Path,
+    secret_key_path: &Path,
+    root_secret_path: &Path,
+    writer: &mut W,
+    options: &ProvenanceOptions,
+) -> Result<(DecryptedArchive, Option<VerifiedProvenance>)> {
+    if !options.require_provenance {
+        if options.signer_public_key.is_some()
+            || options.signer_policy.is_some()
+            || options.allow_retired
+        {
+            bail!("signer options require --require-provenance");
+        }
+        return Ok((
+            decrypt_archive_to(input, secret_key_path, root_secret_path, writer)?,
+            None,
+        ));
+    }
+    let public = options
+        .signer_public_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("--signer-public-key is required"))?;
+    let policy = options
+        .signer_policy
+        .as_deref()
+        .ok_or_else(|| anyhow!("--signer-policy is required"))?;
+    let (decrypted, verified) = verify_provenance_reader(
+        archive_input(input)?,
+        public,
+        policy,
+        options.allow_retired,
+        |reader| {
+            let mut decrypted =
+                decrypt_archive_reader(reader, secret_key_path, root_secret_path, writer)?;
+            let trailer = decrypted.provenance.take();
+            Ok((decrypted, trailer))
+        },
+    )?;
+    Ok((decrypted, Some(verified)))
+}
+
 fn decrypt_archive_to<W: Write>(
     input: &Path,
+    secret_key_path: &Path,
+    root_secret_path: &Path,
+    writer: &mut W,
+) -> Result<DecryptedArchive> {
+    decrypt_archive_reader(
+        &mut ArchiveReader::new(archive_input(input)?, None),
+        secret_key_path,
+        root_secret_path,
+        writer,
+    )
+}
+
+fn decrypt_archive_reader<R: Read, W: Write>(
+    mut reader: &mut ArchiveReader<'_, R>,
     secret_key_path: &Path,
     root_secret_path: &Path,
     writer: &mut W,
@@ -1823,9 +2053,6 @@ fn decrypt_archive_to<W: Write>(
 
     let dk = DecapsulationKey::new_from_slice(seed.as_ref())
         .map_err(|_| anyhow!("invalid ML-KEM secret seed"))?;
-
-    let mut reader =
-        BufReader::new(File::open(input).with_context(|| format!("opening {}", input.display()))?);
 
     let header_len = read_u32(&mut reader)? as usize;
     if header_len > MAX_HEADER_LEN {
@@ -1984,6 +2211,7 @@ fn decrypt_archive_to<W: Write>(
         );
     }
 
+    reader.finish_envelope();
     let provenance = read_optional_provenance(&mut reader, envelope_len)?;
 
     Ok(DecryptedArchive {
@@ -2044,15 +2272,19 @@ fn inspect(input: &Path) -> Result<()> {
     Ok(())
 }
 
-fn scan_archive_layout(input: &Path) -> Result<ArchiveLayout> {
-    let metadata =
-        fs::metadata(input).with_context(|| format!("reading metadata for {}", input.display()))?;
-    if !metadata.is_file() {
+fn archive_input(input: &Path) -> Result<BufReader<File>> {
+    let file = File::open(input).with_context(|| format!("opening archive {}", input.display()))?;
+    if !file.metadata()?.is_file() {
         bail!("archive must be a regular file");
     }
-    let mut reader = BufReader::new(
-        File::open(input).with_context(|| format!("opening archive {}", input.display()))?,
-    );
+    Ok(BufReader::new(file))
+}
+
+fn scan_archive_layout(input: &Path) -> Result<ArchiveLayout> {
+    scan_archive_reader(&mut ArchiveReader::new(archive_input(input)?, None))
+}
+
+fn scan_archive_reader<R: Read>(mut reader: &mut ArchiveReader<'_, R>) -> Result<ArchiveLayout> {
     let header_len = read_u32(&mut reader)? as usize;
     if header_len > MAX_HEADER_LEN {
         bail!("unreasonable header length");
@@ -2106,6 +2338,7 @@ fn scan_archive_layout(input: &Path) -> Result<ArchiveLayout> {
             total
         );
     }
+    reader.finish_envelope();
     let provenance = read_optional_provenance(&mut reader, envelope_len)?;
     Ok(ArchiveLayout {
         header,
@@ -3709,6 +3942,270 @@ unexpected = "field"
         let oversized = "x".repeat(MAX_INVENTORY_LEN as usize + 1);
         assert!(decode_inventory(&oversized).is_err());
         assert!(validate_single_line("safe\u{202e}txt", 200, "label").is_err());
+        Ok(())
+    }
+
+    struct ProvenanceFixture {
+        dir: TestDir,
+        signed: PathBuf,
+        public: PathBuf,
+        signing_secret: PathBuf,
+        policy: PathBuf,
+        seed: PathBuf,
+        root: PathBuf,
+    }
+
+    impl ProvenanceFixture {
+        fn new() -> Result<Self> {
+            let dir = TestDir::new()?;
+            let unsigned = dir.0.join("unsigned.pqbk");
+            let signed = dir.0.join("signed.pqbk");
+            fs::write(
+                &unsigned,
+                build_deterministic_vector("restored.txt", b"phase one content", 4).archive,
+            )?;
+            let (public, signing_secret) =
+                write_test_signing_keys(&dir.0, "signer", test_bytes::<16>(0x81), 7, 0xb0)?;
+            let policy = dir.0.join("policy.toml");
+            signer_policy_init(&policy)?;
+            signer_policy_add(&policy, &public, "Phase one signer", SignerStatus::Trusted)?;
+            sign_archive(&unsigned, Some(&signed), &signing_secret)?;
+            let seed = dir.0.join("seed");
+            let root = dir.0.join("root");
+            fs::write(&seed, test_bytes::<MLKEM_SEED_LEN>(0))?;
+            fs::write(
+                &root,
+                encode_root_key(&RootKey {
+                    id: test_bytes::<16>(0x60),
+                    epoch: 0x0102_0304,
+                    secret: Zeroizing::new(test_bytes::<32>(0x70)),
+                }),
+            )?;
+            Ok(Self {
+                dir,
+                signed,
+                public,
+                signing_secret,
+                policy,
+                seed,
+                root,
+            })
+        }
+
+        fn options(&self) -> ProvenanceOptions {
+            ProvenanceOptions {
+                require_provenance: true,
+                signer_public_key: Some(self.public.clone()),
+                signer_policy: Some(self.policy.clone()),
+                allow_retired: false,
+            }
+        }
+
+        fn rejects(&self, archive: &Path, options: &ProvenanceOptions) -> Result<()> {
+            let output = self.dir.0.join("must-not-exist");
+            let before = fs::read_dir(&self.dir.0)?.count();
+            assert!(verify_archive_with_policy(archive, &self.seed, &self.root, options).is_err());
+            assert!(
+                open_archive_with_policy(archive, Some(&output), &self.seed, &self.root, options)
+                    .is_err()
+            );
+            assert!(!output.exists());
+            assert_eq!(
+                fs::read_dir(&self.dir.0)?.count(),
+                before,
+                "failure left a temporary plaintext file"
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn required_provenance_cli_rejects_incomplete_or_implicit_policy() {
+        for command in ["open", "verify"] {
+            let base = [
+                "pqbackup",
+                command,
+                "a.pqbk",
+                "--secret-key",
+                "seed",
+                "--root-secret",
+                "root",
+            ];
+            for invalid in [
+                vec!["--require-provenance"],
+                vec!["--signer-public-key", "pub"],
+                vec!["--signer-policy", "policy"],
+                vec!["--allow-retired"],
+                vec!["--require-provenance", "--signer-public-key", "pub"],
+                vec!["--require-provenance", "--signer-policy", "policy"],
+                vec!["--signer-public-key", "pub", "--signer-policy", "policy"],
+            ] {
+                assert!(Cli::try_parse_from(base.into_iter().chain(invalid)).is_err());
+            }
+            assert!(Cli::try_parse_from(base).is_ok());
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain([
+                    "--require-provenance",
+                    "--signer-public-key",
+                    "pub",
+                    "--signer-policy",
+                    "policy",
+                    "--allow-retired",
+                ]))
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn required_provenance_enforces_signature_and_content_before_publication() -> Result<()> {
+        let f = ProvenanceFixture::new()?;
+        let options = f.options();
+        let output = f.dir.0.join("restored");
+        open_archive_with_policy(&f.signed, Some(&output), &f.seed, &f.root, &options)?;
+        assert_eq!(fs::read(output)?, b"phase one content");
+        verify_archive_with_policy(&f.signed, &f.seed, &f.root, &options)?;
+        let bytes = fs::read(&f.signed)?;
+        let envelope_len = scan_archive_layout(&f.signed)?.envelope_len as usize;
+        let damaged = f.dir.0.join("damaged.pqbk");
+        let mut bad_signature = bytes.clone();
+        *bad_signature.last_mut().unwrap() ^= 1;
+        let mut extra = bytes.clone();
+        extra.push(0);
+        for invalid in [
+            bytes[..envelope_len].to_vec(),
+            bytes[..bytes.len() - 1].to_vec(),
+            bad_signature,
+            extra,
+        ] {
+            fs::write(&damaged, invalid)?;
+            f.rejects(&damaged, &options)?;
+        }
+        // A valid signature over damaged ciphertext is insufficient for combined verification.
+        let mut bad_content = bytes[..envelope_len].to_vec();
+        bad_content[envelope_len - 1] ^= 1;
+        fs::write(&damaged, bad_content)?;
+        let signed_bad_content = f.dir.0.join("signed-bad-content.pqbk");
+        sign_archive(&damaged, Some(&signed_bad_content), &f.signing_secret)?;
+        verify_provenance(&signed_bad_content, &f.public, &f.policy, false)?;
+        f.rejects(&signed_bad_content, &options)?;
+        // Existing unsigned recovery remains supported without the new policy.
+        fs::write(&damaged, &bytes[..envelope_len])?;
+        verify_archive(&damaged, &f.seed, &f.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn required_provenance_enforces_identity_fingerprint_and_lifecycle() -> Result<()> {
+        let f = ProvenanceFixture::new()?;
+        let mut options = f.options();
+        let (other, _) =
+            write_test_signing_keys(&f.dir.0, "other", test_bytes::<16>(0x81), 7, 0xc0)?;
+        options.signer_public_key = Some(other);
+        f.rejects(&f.signed, &options)?;
+        options = f.options();
+        let original_policy = fs::read_to_string(&f.policy)?;
+        let mut policy = read_signer_policy(&f.policy)?;
+        policy.signers[0].public_sha256 = "00".repeat(32);
+        fs::write(&f.policy, encode_signer_policy(&policy)?)?;
+        f.rejects(&f.signed, &options)?;
+        policy.signers.clear();
+        fs::write(&f.policy, encode_signer_policy(&policy)?)?;
+        f.rejects(&f.signed, &options)?;
+        fs::write(&f.policy, original_policy)?;
+        let id = signer_key_id_hex(&test_bytes::<16>(0x81));
+        signer_policy_set_status(&f.policy, &id, 7, SignerStatus::Retired)?;
+        f.rejects(&f.signed, &options)?;
+        options.allow_retired = true;
+        verify_archive_with_policy(&f.signed, &f.seed, &f.root, &options)?;
+        let output = f.dir.0.join("historical-restored");
+        open_archive_with_policy(&f.signed, Some(&output), &f.seed, &f.root, &options)?;
+        assert_eq!(fs::read(output)?, b"phase one content");
+        signer_policy_set_status(&f.policy, &id, 7, SignerStatus::Revoked)?;
+        f.rejects(&f.signed, &options)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provenance_result_hash_is_bound_to_consumed_bytes_after_path_change() -> Result<()> {
+        for replace in [false, true] {
+            let f = ProvenanceFixture::new()?;
+            let original = fs::read(&f.signed)?;
+            let (_, verified) = verify_provenance_reader(
+                archive_input(&f.signed)?,
+                &f.public,
+                &f.policy,
+                false,
+                |reader| {
+                    let layout = scan_archive_reader(reader)?;
+                    // Deterministic hook at the former scan/verify/hash boundary.
+                    if replace {
+                        fs::rename(&f.signed, f.dir.0.join("original"))?;
+                    }
+                    fs::write(&f.signed, b"unverified replacement")?;
+                    Ok(((), layout.provenance))
+                },
+            )?;
+            assert_eq!(verified.archive_sha256, sha256_hex(&original));
+            assert_eq!(verified.archive_len, original.len() as u64);
+            assert_eq!(verified.identity, "Phase one signer");
+            assert_eq!(verified.signer_epoch, 7);
+            assert_ne!(verified.archive_sha256, sha256_file(&f.signed)?);
+        }
+        Ok(())
+    }
+
+    struct HookedRead<F> {
+        file: File,
+        hook: Option<F>,
+        consumed: usize,
+    }
+
+    impl<F: FnOnce() -> std::io::Result<()>> Read for HookedRead<F> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.consumed >= 128
+                && let Some(hook) = self.hook.take()
+            {
+                hook()?;
+            }
+            let max = buf.len().min(128);
+            let n = self.file.read(&mut buf[..max])?;
+            self.consumed += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn combined_stream_verification_handles_replacement_and_in_place_mutation() -> Result<()> {
+        for replace in [false, true] {
+            let f = ProvenanceFixture::new()?;
+            let original = fs::read(&f.signed)?;
+            let mut modified = original.clone();
+            let end = scan_archive_layout(&f.signed)?.envelope_len as usize;
+            modified[end - 1] ^= 1;
+            let source = HookedRead {
+                file: File::open(&f.signed)?,
+                consumed: 0,
+                hook: Some(|| {
+                    if replace {
+                        fs::rename(&f.signed, f.dir.0.join("original"))?;
+                    }
+                    fs::write(&f.signed, modified)
+                }),
+            };
+            let mut plaintext = Vec::new();
+            let result = verify_provenance_reader(source, &f.public, &f.policy, false, |reader| {
+                let mut decoded = decrypt_archive_reader(reader, &f.seed, &f.root, &mut plaintext)?;
+                Ok(((), decoded.provenance.take()))
+            });
+            if replace {
+                let (_, verified) = result?;
+                assert_eq!(verified.archive_sha256, sha256_hex(&original));
+                assert_eq!(plaintext, b"phase one content");
+            } else {
+                assert!(result.is_err(), "mutation of unread ciphertext must fail");
+            }
+        }
         Ok(())
     }
 

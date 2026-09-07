@@ -1,7 +1,7 @@
 # Recovery runbook
 
 **Applies to:** `PQBACK02`, `PQROOT02`, `PQINVENTORY01`, and optional
-`PQSIG001` provenance as shipped with `pqbackup` 0.0.6. This project remains
+`PQSIG001` provenance, including required-provenance recovery in `pqbackup` 0.1.2. This project remains
 experimental and unaudited.
 
 This runbook is for recovering data after the original development machine,
@@ -170,13 +170,18 @@ documented source/lock/toolchain inputs together.
 3. Run `inspect` and record the visible root-key and signer routing metadata.
    Treat it only as unauthenticated hints.
 4. If provenance matters, retrieve the independently authenticated signer
-   public key and historical policy, then run `provenance-verify`. Record that
-   it does not establish creation time or newest-backup status.
+   public key and applicable policy. An optional `provenance-verify` check
+   provides signature-only verification without recovery secrets. It does not
+   establish creation time or newest-backup status.
 5. Retrieve the matching root key and ML-KEM seed through their separate
    custody procedures.
-6. Run `verify` before creating plaintext.
-7. Run `open` to a new destination on a local filesystem. Existing files are
-   never overwritten.
+6. Run `verify` before creating plaintext. When provenance is required, supply
+   `--require-provenance --signer-public-key PATH --signer-policy PATH`.
+7. Run `open` to a new destination on a local filesystem, with the same required
+   provenance arguments when applicable. An earlier standalone check does not
+   authorize later reads of a mutable archive. Add `--allow-retired` only for
+   approved historical signers; revoked signers always fail. Existing files
+   are never overwritten.
 8. Validate the recovered application's own hashes or file structure.
 9. Remove both secret media, record the drill, and handle plaintext according
    to the data policy. Secure deletion is not guaranteed on SSD, snapshots,

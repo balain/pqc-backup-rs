@@ -95,6 +95,12 @@ exact bytes to an identity only after a separately authenticated public key and
 lifecycle state. Retired keys require explicit historical acceptance; revoked
 keys are rejected.
 
+Version 0.1.2 adds `--require-provenance` to `open` and `verify`, with explicit
+signer public key and policy arguments. This mode authenticates encrypted
+contents and provenance from the same stream before success or plaintext
+publication. Default unsigned recovery remains supported. See
+[provenance policy](./PROVENANCE_POLICY.md) for exact requirements and limits.
+
 This is creator authentication, not non-repudiation, trusted time, freshness,
 or rollback prevention. Valid copies and older valid archives remain valid.
 Those properties require an authenticated append-only catalog or trusted

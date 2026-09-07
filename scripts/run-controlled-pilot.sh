@@ -93,6 +93,34 @@ echo "scenario.inspect_redaction=PASS"
 cmp "$plaintext" "$recovery/restored.txt"
 echo "scenario.clean_restore=PASS"
 
+"$binary" verify "$signed" \
+  --secret-key "$kem_custody/pilot.mlkem1024.seed" \
+  --root-secret "$root_custody/pilot.root.key" \
+  --require-provenance \
+  --signer-public-key "$signing_custody/pilot-signer.mldsa87.pub" \
+  --signer-policy "$policy" >/dev/null
+"$binary" open "$signed" \
+  --secret-key "$kem_custody/pilot.mlkem1024.seed" \
+  --root-secret "$root_custody/pilot.root.key" \
+  --require-provenance \
+  --signer-public-key "$signing_custody/pilot-signer.mldsa87.pub" \
+  --signer-policy "$policy" \
+  --output "$recovery/required-provenance.txt" >/dev/null
+cmp "$plaintext" "$recovery/required-provenance.txt"
+echo "scenario.required_provenance_restore=PASS"
+expect_failure unsigned_required_provenance "$binary" open "$unsigned" \
+  --secret-key "$kem_custody/pilot.mlkem1024.seed" \
+  --root-secret "$root_custody/pilot.root.key" \
+  --require-provenance \
+  --signer-public-key "$signing_custody/pilot-signer.mldsa87.pub" \
+  --signer-policy "$policy" \
+  --output "$recovery/must-not-exist.txt"
+if [ -e "$recovery/must-not-exist.txt" ]; then
+  echo "pilot error: unsigned required restore published plaintext" >&2
+  exit 1
+fi
+
+
 cp "$signed" "$pilot_dir/stolen.pqbk"
 expect_failure archive_theft "$binary" open "$pilot_dir/stolen.pqbk" \
   --secret-key "$pilot_dir/unavailable.mlkem1024.seed" \
