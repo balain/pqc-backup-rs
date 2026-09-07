@@ -20,6 +20,10 @@ state across multiple otherwise valid archives. Neither eliminates endpoint
 compromise, replaces independent backups, or completes the outstanding Phase 6
 external-review and real-custody gates.
 
+The execution boundary is split into
+`docs/OWNER_CONTROLLED_SECURITY_WORK.md` and
+`docs/EXTERNAL_ASSURANCE_REQUIREMENTS.md`.
+
 ## Current baseline
 
 `PQBACK02` derives each archive's 256-bit Key Encryption Key (KEK) from:

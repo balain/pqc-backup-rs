@@ -36,6 +36,8 @@ Security policy and planning documents:
 - [Production-readiness statement](docs/PRODUCTION_READINESS.md)
 - [Residual-risk acceptance template](docs/RESIDUAL_RISK_ACCEPTANCE.md)
 - [Future security options](docs/FUTURE_SECURITY_OPTIONS.md)
+- [Owner-controlled security work](docs/OWNER_CONTROLLED_SECURITY_WORK.md)
+- [External assurance requirements](docs/EXTERNAL_ASSURANCE_REQUIREMENTS.md)
 
 ## Quick start: run the complete demo
 
