@@ -35,6 +35,7 @@ Security policy and planning documents:
 - [Controlled-pilot procedure and evidence](docs/CONTROLLED_PILOT.md)
 - [Production-readiness statement](docs/PRODUCTION_READINESS.md)
 - [Residual-risk acceptance template](docs/RESIDUAL_RISK_ACCEPTANCE.md)
+- [Future security options](docs/FUTURE_SECURITY_OPTIONS.md)
 
 ## Quick start: run the complete demo
 
