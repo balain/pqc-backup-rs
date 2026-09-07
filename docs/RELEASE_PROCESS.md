@@ -1,7 +1,7 @@
 # Release process
 
 This process produces the independently verifiable artifacts required by
-Phase 4. The unsigned `PQBACK02` envelope remains frozen; version 0.0.5 adds
+Phase 4. The unsigned `PQBACK02` envelope remains frozen; version 0.0.5 added
 the separately specified optional `PQSIG001` archive-provenance extension.
 
 ## Release gates
@@ -12,11 +12,13 @@ Before tagging:
 2. Update the version in `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
 3. Run formatting, linting, locked tests, the dependency policy check, and the
    same-host release reproducibility check.
-4. Review changes to format code against `docs/FORMAT_COMPATIBILITY.md` and the
+4. Run `scripts/run-controlled-pilot.sh` against the candidate binary and
+   review every scenario result.
+5. Review changes to format code against `docs/FORMAT_COMPATIBILITY.md` and the
    deterministic vectors.
-5. Have a second maintainer review the commit and record approval outside the
+6. Have a second maintainer review the commit and record approval outside the
    repository for any release intended for real recovery use.
-6. Confirm that no secret material, archive, local path, or personal data is
+7. Confirm that no secret material, archive, local path, or personal data is
    staged.
 
 Required local checks:
@@ -26,6 +28,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
 cargo deny check advisories bans licenses sources
+./scripts/run-controlled-pilot.sh target/debug/pqbackup
 ./scripts/verify-release-build.sh "$(rustc -vV | sed -n 's/^host: //p')"
 ```
 

@@ -4,7 +4,7 @@
 **Basis:** [Long-term security assessment](./LONG_TERM_SECURITY_ASSESSMENT.md)  
 **Current format:** `PQBACK02` archives and `PQROOT02` root keys
 
-**Phase status:** Phases 0, 1, and 2 completed on 2026-09-06. Phase 3 engineering completed on 2026-09-06; its operator recovery-drill gate remains pending. Phase 4 engineering completed on 2026-09-06; signed-tag, two-person verification, separate-copy, and scheduled-owner gates remain pending. Phase 5 engineering completed on 2026-09-06; independent approval remains a Phase 6 gate.
+**Phase status:** Phases 0, 1, and 2 completed on 2026-09-06. Phase 3 engineering completed on 2026-09-06; its operator recovery-drill gate remains pending. Phase 4 engineering completed on 2026-09-06; signed-tag, two-person verification, separate-copy, and scheduled-owner gates remain pending. Phase 5 engineering completed on 2026-09-06. Phase 6 engineering preparation and simulated pilot completed on 2026-09-06; independent review, real separated-custody pilot, and named risk acceptance remain pending.
 
 ## Objective
 
@@ -303,6 +303,14 @@ This phase is conditional. Skip it if the product only needs confidentiality and
 **Estimated effort:** L.
 
 ## Phase 6 — Independent review and controlled pilot
+
+**Engineering status: Prepared; external gates pending (2026-09-06).** The
+candidate now includes an independent-review brief, durable remediation
+register, clean offline-rebuild and controlled-pilot automation, pilot evidence
+procedure, deployment risk-acceptance template, and an explicit NO-GO
+production-readiness statement. Maintainer pre-review findings have regression
+coverage. No external review or real independent-custody drill has occurred;
+Phase 6 is therefore not complete.
 
 **Goal:** obtain external evidence and validate the complete technical and operational system.
 

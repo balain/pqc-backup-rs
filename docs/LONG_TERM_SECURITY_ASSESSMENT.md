@@ -1,6 +1,6 @@
 # Long-term security assessment
 
-**Assessment date:** 2026-09-05; updated through Phase 5 engineering on 2026-09-06
+**Assessment date:** 2026-09-05; updated through Phase 6 engineering preparation on 2026-09-06
 **Assessed revision:** `PQBACK02` / `PQROOT02`  
 **Scope:** local archival confidentiality and recoverability. This is a source review, not an independent audit, certification, or security guarantee.
 
@@ -56,7 +56,7 @@ Header ID/epoch values are visible and not authenticated until recovery reaches 
 
 ### Creator authentication is optional; time and rollback remain external
 
-AES-GCM authenticates an archive to someone holding the recovery capability; it does not prove who created it. Version 0.0.5 can append an ML-DSA-87 signature over the complete encrypted envelope and signer ID/epoch statement. Verification binds that signature to a human or service identity only through a separately authenticated public key and `PQSIGNERS01` policy. Trusted, retired, and revoked states make key lifecycle decisions explicit.
+AES-GCM authenticates an archive to someone holding the recovery capability; it does not prove who created it. Version 0.0.6 can append an ML-DSA-87 signature over the complete encrypted envelope and signer ID/epoch statement. Verification binds that signature to a human or service identity only through a separately authenticated public key and `PQSIGNERS01` policy. Trusted, retired, and revoked states make key lifecycle decisions explicit. Version 0.0.6 also prevents a revoked signer epoch from regaining authority through the CLI.
 
 There is still no trusted timestamp, append-only catalog, deletion detection, or newest-backup selection. A byte-for-byte copy or older valid archive remains cryptographically valid. Operators requiring replay or rollback evidence must maintain an authenticated external catalog with monotonic application state.
 
@@ -73,6 +73,11 @@ attested recovery kits. It still lacks an independent implementation,
 maintainer-signed source tags, sustained external fuzzing, and independent
 security review. Explicit algorithm IDs help future migration but do not
 implement algorithm agility.
+
+Phase 6 engineering adds a maintainer pre-review record and an automated
+non-critical pilot across clean restore and expected-failure scenarios. It is
+useful regression evidence, but its directory separation on one host does not
+satisfy independent review, physical custody, or clean-room human-drill gates.
 
 ### Archive-size bounds are conservative, not formally proven
 
@@ -105,6 +110,7 @@ verified copies and continue scheduled restore and migration drills.
 | Release provenance | Good for tagged artifacts | GitHub/Sigstore attestation and trusted roots are preserved and verified. |
 | Endpoint-compromise resistance | Weak | Secrets/plaintext enter the local process. |
 | Compliance readiness | Insufficient | No validation or independent audit evidence. |
+| Phase 6 production gate | Blocked | External review, real separated-custody drill, and named risk acceptance remain absent. |
 | Multi-decade recoverability | Moderate | Attested offline recovery kits exist; active preservation and migration remain required. |
 
 ## Recommended improvements

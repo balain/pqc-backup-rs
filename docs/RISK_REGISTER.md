@@ -10,7 +10,7 @@
 | R-003 | Hostile parser coverage is limited | High | Mitigated | Maintainer | Phase 2 added corruption/truncation/property tests, production-parser fuzz targets, ASan smoke campaigns, and CI fuzzing. Continue growing the corpus. |
 | R-004 | Endpoint compromise exposes plaintext and active secrets | Critical | Accepted/deferred | Operator | Hardened recovery host and custody now; provider/memory controls in Phase 3. Cannot be eliminated in software alone. |
 | R-005 | Co-locating both recovery secrets defeats separation | Critical | Mitigated | Operator | Combined `keygen` removed; separate commands and explicit demo warning implemented in Phase 0. |
-| R-006 | Loss of either secret class makes archives unrecoverable | Critical | Open | Operator | Phase 3 added inventory tooling and a two-copy recovery-drill procedure; remains open until operators provision and exercise independent copies. |
+| R-006 | Loss of either secret class makes archives unrecoverable | Critical | Open | Operator | Phase 3 added inventory tooling and a two-copy recovery-drill procedure. Phase 6 simulates missing copies; real independent copies and a clean-room drill remain required. |
 | R-007 | No explicit conservative archive-size/chunk-count enforcement | High | Mitigated | Maintainer | Phase 2 enforces and boundary-tests 1 TiB plaintext and 2^20 data-frame ceilings. |
 | R-008 | Creator authentication, timestamp, or rollback evidence is absent or misinterpreted | Medium | Partially mitigated | Product owner | Phase 5 adds ML-DSA-87 creator authentication and lifecycle policy. Trusted time and rollback detection still require an external catalog. |
 | R-009 | Visible length and routing metadata enable inference | Medium | Accepted/deferred | Product owner | Document exposure; padding/profile decision requires a future format design. |
@@ -23,11 +23,12 @@
 | R-016 | No formal compliance or cryptographic-module validation | High | Accepted/deferred | Product owner | Prohibit such claims; deployment-specific compliance work after Phase 6. |
 | R-017 | Demo mode intentionally co-locates disposable secrets | Medium | Mitigated | Maintainer | Prominent runtime warning and documentation; demo files must never become production keys. |
 | R-018 | Supported filesystem/OS behavior is not broadly validated | Medium | Open | Maintainer | Phase 3 atomically creates Unix secret/inventory files with mode `0600` and tests permissions; broader platform/filesystem validation remains open. |
-| R-019 | `ml-dsa` 0.1.1 and the Phase 5 signature integration lack independent audit | High | External dependency | Maintainer | Track upstream advisories; preserve explicit experimental status; review construction and implementation in Phase 6. |
+| R-019 | `ml-dsa` 0.1.1 and the Phase 5 signature integration lack independent audit | High | External dependency | Maintainer | Current advisory policy passes and historical relevant advisories affect earlier versions; independent review of the construction and implementation remains required. |
 | R-020 | Signer trust policy or public-key substitution can forge identity decisions | High | Open | Operator | Phase 5 binds ID/epoch/fingerprint and rejects duplicates; deployments must authenticate policy distribution and retain policy history. |
+| R-021 | Lifecycle rollback could restore authority to compromised/revoked epochs | High | Mitigated | Maintainer | Version 0.0.6 enforces one-way root and signer status transitions with regression tests; direct policy-file integrity remains an operator control under R-020. |
 
 ## Phase 0 disposition
 
-Phase 0 establishes ownership and policy; it does not close risks assigned to later phases. The current release remains experimental. Production consideration is blocked by R-001, R-006, R-011, the incomplete Phase 3/4 operational gates, and the independent-review gate.
+Phase 0 establishes ownership and policy; it does not close risks assigned to later phases. The current release remains experimental. Production consideration is blocked by R-001, R-006, R-011, R-019, R-020, incomplete operational gates, the external-review gate, and deployment-specific risk acceptance.
 
 Review this register whenever a phase completes, a dependency changes, a security report arrives, or a new deployment environment is proposed.

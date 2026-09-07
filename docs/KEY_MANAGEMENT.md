@@ -105,6 +105,13 @@ Changing a root key does not alter existing archives. Migration requires
 decrypting and resealing each archive under the new epoch, then independently
 verifying the replacement before retiring the old archive.
 
+Inventory lifecycle changes through the CLI are monotonic. An active epoch may
+be retired, compromised, or destroyed; a retired epoch may become compromised
+or destroyed; a compromised epoch may become destroyed. A compromised,
+destroyed, or retired epoch cannot return to active. Create a fresh epoch
+instead. This protects against accidental state rollback but does not
+authenticate the inventory file itself.
+
 ## Retirement and destruction
 
 Retirement prohibits new sealing but preserves recovery capability. Mark the

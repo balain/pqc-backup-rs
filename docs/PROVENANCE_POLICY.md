@@ -27,7 +27,7 @@ identity; it does not decrypt archives. Keep it offline or in a hardened
 signing environment, and copy only the public key to verification systems.
 
 For automated signing, use a dedicated restricted host and short rotation
-epochs. `pqbackup` 0.0.5 uses exportable seed files and does not yet support an
+epochs. `pqbackup` 0.0.6 uses exportable seed files and does not yet support an
 HSM or remote signer.
 
 ## Policy format
@@ -61,6 +61,10 @@ the CLI creates it with mode `0600` on supported Unix systems.
 
 `--allow-retired` is only for an archive already approved as historical. It
 does not override `revoked`.
+
+Lifecycle changes through the CLI are monotonic. A trusted signer may be
+retired or revoked, and a retired signer may later be revoked. A revoked epoch
+cannot return to trusted or retired; generate and authenticate a new epoch.
 
 Never delete a record merely because its key is retired or revoked. Historical
 records provide the policy evidence needed to interpret older archives. Store
@@ -134,7 +138,7 @@ at least:
 - supersession or deletion state; and
 - a monotonic or append-only integrity mechanism.
 
-Version 0.0.5 does not implement that catalog or a trusted timestamp protocol.
+Version 0.0.6 does not implement that catalog or a trusted timestamp protocol.
 Therefore provenance verification answers **who signed these exact encrypted
 bytes under the current policy**, not **when they were signed** or **whether
 they are the newest backup**.

@@ -35,6 +35,13 @@ jobs:
       - name: Run tests
         run: cargo test --locked --verbose
 
+      - name: Rebuild offline and run controlled-pilot scenarios
+        run: |
+          pilot_target="$(mktemp -d)"
+          trap 'rm -rf "$pilot_target"' EXIT
+          CARGO_TARGET_DIR="$pilot_target" cargo build --locked --offline
+          ./scripts/run-controlled-pilot.sh "$pilot_target/debug/pqbackup"
+
   supply-chain:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

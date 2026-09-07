@@ -4,6 +4,17 @@ All notable security-relevant and user-visible changes are recorded here.
 
 ## Unreleased
 
+## 0.0.6 - 2026-09-06
+
+### Phase 6 review candidate and controlled pilot
+
+- Added an independent-review package, finding/remediation register, controlled-pilot evidence procedure, residual-risk template, and explicit production-readiness decision.
+- Added a disposable controlled-pilot gate covering encrypted filename inspection, clean recovery, archive theft, corruption, lost secret copies, wrong epochs, revoked signers, and signer substitution.
+- Added a clean locked offline rebuild before the controlled pilot in CI.
+- Made root-key and signer lifecycle transitions monotonic so compromised, destroyed, or revoked epochs cannot regain authority.
+- Added regression coverage for irreversible lifecycle transitions and malformed ML-KEM public-key rejection.
+- Preserved a NO-GO decision for production until an independent review, real separated-custody drill, and named deployment owner acceptance are complete.
+
 ## 0.0.5 - 2026-09-06
 
 ### Phase 5 archive provenance

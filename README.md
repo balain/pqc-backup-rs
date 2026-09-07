@@ -30,6 +30,11 @@ Security policy and planning documents:
 - [Deterministic test vectors](test-vectors/manifest.md)
 - [Release process](docs/RELEASE_PROCESS.md)
 - [Recovery runbook](docs/RECOVERY_RUNBOOK.md)
+- [Phase 6 security-review package](docs/SECURITY_REVIEW_PACKAGE.md)
+- [Finding and remediation record](docs/PHASE6_REMEDIATION.md)
+- [Controlled-pilot procedure and evidence](docs/CONTROLLED_PILOT.md)
+- [Production-readiness statement](docs/PRODUCTION_READINESS.md)
+- [Residual-risk acceptance template](docs/RESIDUAL_RISK_ACCEPTANCE.md)
 
 ## Quick start: run the complete demo
 
@@ -45,6 +50,17 @@ archive, and a restored copy. It verifies both archive provenance and encrypted
 content before comparing the restored file to the input. It does not overwrite
 existing output files. The demo keeps all secrets together for convenience
 only; do not copy that custody pattern for real backups.
+
+For the repeatable Phase 6 engineering pilot, which simulates separated
+custody and exercises expected failure cases with disposable data, run:
+
+```bash
+cargo build --locked
+./scripts/run-controlled-pilot.sh target/debug/pqbackup
+```
+
+This is not a substitute for the independent review or real physical-custody
+drill required before production consideration.
 
 ## Cryptographic design
 
@@ -173,6 +189,9 @@ Run `pqbackup <command> --help` for the complete argument help. Commands that
 create keys, archives, demos, or inventories refuse to overwrite files.
 `inventory add` and `inventory set-status` atomically update an existing
 inventory. Signer-policy updates are also atomic.
+Compromise-related lifecycle transitions are one-way: a compromised or
+destroyed root-key epoch cannot become active again, and a revoked signer epoch
+cannot become trusted or retired. Create a new epoch instead.
 
 ## One-time setup
 
@@ -521,6 +540,9 @@ frame allocations are bounded before memory is allocated. See
 - The RustCrypto `ml-kem` implementation currently warns that it has not been
   independently audited.
 - This project has not itself received a security review.
+- The automated controlled pilot simulates custody on one host; independent
+  review, real separated-media recovery, and named risk acceptance remain
+  incomplete. The current production decision is NO-GO.
 - The original filename is encrypted and authenticated in `PQBACK02`. File
   length remains visible to support streaming and recovery checks.
 - An optional ML-DSA-87 extension provides creator attribution only when its

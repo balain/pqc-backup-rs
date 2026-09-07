@@ -1,7 +1,7 @@
 # Recovery runbook
 
 **Applies to:** `PQBACK02`, `PQROOT02`, `PQINVENTORY01`, and optional
-`PQSIG001` provenance as shipped with `pqbackup` 0.0.5. This project remains
+`PQSIG001` provenance as shipped with `pqbackup` 0.0.6. This project remains
 experimental and unaudited.
 
 This runbook is for recovering data after the original development machine,
@@ -201,3 +201,7 @@ Migrate archives before a primitive, dependency, operating environment, or
 storage medium leaves the organization's accepted risk boundary. Never destroy
 the old key epoch or archive until the replacement has been independently
 verified and its recovery drill has passed.
+
+The disposable automation in `scripts/run-controlled-pilot.sh` may be used to
+check software behavior before a drill. It cannot replace the independent
+custody, clean system, human operators, and retained evidence required here.

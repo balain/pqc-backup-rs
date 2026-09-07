@@ -926,9 +926,29 @@ fn inventory_set_status(
         .ok_or_else(|| {
             anyhow!("inventory has no record for root key {canonical_id} epoch {root_key_epoch}")
         })?;
+    ensure_root_key_status_transition(record.status, status)?;
     record.status = status;
     replace_inventory(path, &encode_inventory(&inventory)?)?;
     println!("Updated root key {canonical_id} epoch {root_key_epoch} to {status}.");
+    Ok(())
+}
+
+fn ensure_root_key_status_transition(current: RootKeyStatus, next: RootKeyStatus) -> Result<()> {
+    let permitted = matches!(
+        (current, next),
+        (RootKeyStatus::Active, _)
+            | (RootKeyStatus::Retired, RootKeyStatus::Retired)
+            | (RootKeyStatus::Retired, RootKeyStatus::Compromised)
+            | (RootKeyStatus::Retired, RootKeyStatus::Destroyed)
+            | (RootKeyStatus::Compromised, RootKeyStatus::Compromised)
+            | (RootKeyStatus::Compromised, RootKeyStatus::Destroyed)
+            | (RootKeyStatus::Destroyed, RootKeyStatus::Destroyed)
+    );
+    if !permitted {
+        bail!(
+            "root-key lifecycle cannot move from {current} to {next}; create a new epoch instead"
+        );
+    }
     Ok(())
 }
 
@@ -1165,9 +1185,24 @@ fn signer_policy_set_status(
         .ok_or_else(|| {
             anyhow!("policy has no record for signer {canonical_id} epoch {signer_key_epoch}")
         })?;
+    ensure_signer_status_transition(record.status, status)?;
     record.status = status;
     replace_signer_policy(path, &encode_signer_policy(&policy)?)?;
     println!("Updated signer {canonical_id} epoch {signer_key_epoch} to {status}.");
+    Ok(())
+}
+
+fn ensure_signer_status_transition(current: SignerStatus, next: SignerStatus) -> Result<()> {
+    let permitted = matches!(
+        (current, next),
+        (SignerStatus::Trusted, _)
+            | (SignerStatus::Retired, SignerStatus::Retired)
+            | (SignerStatus::Retired, SignerStatus::Revoked)
+            | (SignerStatus::Revoked, SignerStatus::Revoked)
+    );
+    if !permitted {
+        bail!("signer lifecycle cannot move from {current} to {next}; create a new epoch instead");
+    }
     Ok(())
 }
 
@@ -3589,6 +3624,30 @@ mod tests {
             RootKeyStatus::Retired
         );
         assert!(
+            inventory_set_status(
+                &inventory_path,
+                &root_key_id_hex(&root.id),
+                root.epoch,
+                RootKeyStatus::Active,
+            )
+            .is_err()
+        );
+        inventory_set_status(
+            &inventory_path,
+            &root_key_id_hex(&root.id),
+            root.epoch,
+            RootKeyStatus::Compromised,
+        )?;
+        assert!(
+            inventory_set_status(
+                &inventory_path,
+                &root_key_id_hex(&root.id),
+                root.epoch,
+                RootKeyStatus::Retired,
+            )
+            .is_err()
+        );
+        assert!(
             inventory_add(
                 &inventory_path,
                 &root_path,
@@ -3773,7 +3832,66 @@ unexpected = "field"
         signer_policy_set_status(&policy, &id, 3, SignerStatus::Revoked)?;
         assert!(verify_provenance(&signed, &public, &policy, false).is_err());
         assert!(verify_provenance(&signed, &public, &policy, true).is_err());
+        assert!(
+            signer_policy_set_status(&policy, &id, 3, SignerStatus::Trusted).is_err(),
+            "revocation must be irreversible for an existing epoch"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn malformed_ml_kem_public_key_is_rejected() -> Result<()> {
+        let dir = TestDir::new()?;
+        let invalid = dir.0.join("invalid.mlkem1024.pub");
+        fs::write(&invalid, vec![0xff; MLKEM1024_PK_LEN])?;
+        assert!(key_info(&invalid, KeyFileKind::KemPublic).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_transition_matrices_are_monotonic() {
+        for (current, next, permitted) in [
+            (RootKeyStatus::Active, RootKeyStatus::Active, true),
+            (RootKeyStatus::Active, RootKeyStatus::Retired, true),
+            (RootKeyStatus::Active, RootKeyStatus::Compromised, true),
+            (RootKeyStatus::Active, RootKeyStatus::Destroyed, true),
+            (RootKeyStatus::Retired, RootKeyStatus::Active, false),
+            (RootKeyStatus::Retired, RootKeyStatus::Retired, true),
+            (RootKeyStatus::Retired, RootKeyStatus::Compromised, true),
+            (RootKeyStatus::Retired, RootKeyStatus::Destroyed, true),
+            (RootKeyStatus::Compromised, RootKeyStatus::Active, false),
+            (RootKeyStatus::Compromised, RootKeyStatus::Retired, false),
+            (RootKeyStatus::Compromised, RootKeyStatus::Compromised, true),
+            (RootKeyStatus::Compromised, RootKeyStatus::Destroyed, true),
+            (RootKeyStatus::Destroyed, RootKeyStatus::Active, false),
+            (RootKeyStatus::Destroyed, RootKeyStatus::Retired, false),
+            (RootKeyStatus::Destroyed, RootKeyStatus::Compromised, false),
+            (RootKeyStatus::Destroyed, RootKeyStatus::Destroyed, true),
+        ] {
+            assert_eq!(
+                ensure_root_key_status_transition(current, next).is_ok(),
+                permitted,
+                "unexpected root-key transition result for {current} -> {next}"
+            );
+        }
+
+        for (current, next, permitted) in [
+            (SignerStatus::Trusted, SignerStatus::Trusted, true),
+            (SignerStatus::Trusted, SignerStatus::Retired, true),
+            (SignerStatus::Trusted, SignerStatus::Revoked, true),
+            (SignerStatus::Retired, SignerStatus::Trusted, false),
+            (SignerStatus::Retired, SignerStatus::Retired, true),
+            (SignerStatus::Retired, SignerStatus::Revoked, true),
+            (SignerStatus::Revoked, SignerStatus::Trusted, false),
+            (SignerStatus::Revoked, SignerStatus::Retired, false),
+            (SignerStatus::Revoked, SignerStatus::Revoked, true),
+        ] {
+            assert_eq!(
+                ensure_signer_status_transition(current, next).is_ok(),
+                permitted,
+                "unexpected signer transition result for {current} -> {next}"
+            );
+        }
     }
 
     #[test]

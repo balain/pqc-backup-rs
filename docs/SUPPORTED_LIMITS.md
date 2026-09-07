@@ -1,6 +1,6 @@
 # Supported limits and environments
 
-**Status:** Phase 5 engineering baseline (2026-09-06).
+**Status:** Phase 6 review-candidate baseline (2026-09-06).
 
 ## Supported environment
 
@@ -9,7 +9,7 @@ The security-supported development scope is:
 - 64-bit macOS and Linux;
 - regular local files on filesystems providing reliable same-directory hard links;
 - an operating system CSPRNG available through `getrandom`;
-- the pinned Rust 1.97.1 toolchain when rebuilding release 0.0.5.
+- the pinned Rust 1.97.1 toolchain when rebuilding release 0.0.6.
 
 Windows, network filesystems, cloud-synchronized folders, FUSE filesystems, object-store mounts, unusual removable-media filesystems, containers with weak entropy, and 32-bit targets are not security-supported yet. They may work, but file permissions, atomic publication, durability, and failure behavior have not been validated.
 
